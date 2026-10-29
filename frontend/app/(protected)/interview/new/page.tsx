@@ -1,5 +1,5 @@
 "use client";
-import {api} from "@/lib/api";
+import { api, auth, errorMessage } from "@/lib/api";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import AppShell from "@/components/layout/app-shell";
@@ -7,7 +7,6 @@ import {
   ArrowRight, ArrowLeft, Building2, Briefcase, Gauge,
   Loader2, CheckCircle2, Circle, Search, ChevronRight,
 } from "lucide-react";
-import { auth } from "@/lib/api";
 
 const COMPANIES = [
   { name: "Google",    color: "#4285F4", initials: "G"  },
@@ -46,28 +45,32 @@ export default function NewInterviewPage() {
   const [loading, setLoading] = useState(false);
   const [pipelineStep, setPipelineStep] = useState<PipelineStep | null>(null);
   const [doneSteps, setDoneSteps] = useState<string[]>([]);
+  const [startError, setStartError] = useState<string | null>(null);
 
-  const  user  = auth.load()!;
-  const userId = user?.user_id;
-  const userName = user?.name;
+  const  user  = auth.load();
+  const userName = user?.name ?? "Candidate";
 
   const filteredCompanies = COMPANIES.filter(c =>
     c.name.toLowerCase().includes(companyQuery.toLowerCase())
   );
 
   const handleStart = async () => {
-    if (!company || !role) return;
+    if (!company || !role.trim() || loading) return;
     setLoading(true);
+    setStartError(null);
+    setDoneSteps([]);
     const steps: PipelineStep[] = ["researching", "extracting", "building", "generating"];
     setPipelineStep(steps[0]);
     try {
+      // The token identifies the user; user_id is no longer needed.
       const resultPromise = api.interviews.start({
-        user_id: userId!,
-        username:userName!,
+        username: userName,
         company,
-        role,
+        role: role.trim(),
         difficulty,
       });
+      // Avoid an unhandled rejection while the progress animation runs.
+      resultPromise.catch(() => undefined);
 
       for(let i = 1; i < steps.length; i++) {
         await new Promise(res => setTimeout(res, 1500)); // Simulate time taken for each step
@@ -79,7 +82,8 @@ export default function NewInterviewPage() {
       router.push(`/interview/${result.interview_id}`);
     } catch (error) {
       console.error("Error starting interview:", error);
-      alert("Failed to start interview. Please try again.");
+      setStartError(errorMessage(error, "Failed to start the interview. Please try again."));
+      setPipelineStep(null);
       setLoading(false);
     }
   };
@@ -336,6 +340,11 @@ export default function NewInterviewPage() {
                     </div>
                   ))}
                 </div>
+                {startError && (
+                  <p role="alert" style={{ fontSize: "13px", color: "#EF4444", marginBottom: "16px", lineHeight: 1.5 }}>
+                    {startError}
+                  </p>
+                )}
                 <button
                   id="start-interview-btn"
                   onClick={handleStart}
