@@ -19,7 +19,9 @@ from rag.vector_store import VectorStore
 from normalization.normalizer import ExtractionNormalizer
 from search.anakin import AnakinAgent
 import asyncio
+import logging
 
+logger = logging.getLogger(__name__)
 
 class ResearchPipeline:
     """End-to-end research pipeline for a company/role pair."""
@@ -99,9 +101,12 @@ class ResearchPipeline:
 
         selected_results = interview_results[:4] + process_results[:2] + job_results[:2]
 
-        print(f"[pipeline] Selected {len(selected_results)} results for scraping:")
+        logger.info("[pipeline] Selected %d results for scraping", len(selected_results))
         for r in selected_results:
-            print(f"[pipeline] - {r['url']} (category: {r['category']}, relevance_score: {r['relevance_score']})")
+            logger.info(
+                "[pipeline] - %s (category: %s, relevance_score: %s)",
+                r["url"], r["category"], r["relevance_score"],
+            )
 
         if(len(selected_results)<8):
             used_urls = set(r["url"] for r in selected_results)
@@ -120,11 +125,19 @@ class ResearchPipeline:
             else:
                 top_urls.append(r["url"])
 
-        # 2. Scrape non-Reddit URLs via Firecrawl; Reddit URLs via Anakin
-        scraped,reddit_scraped = await asyncio.gather(
+        # 2. Scrape non-Reddit URLs via Firecrawl; Reddit URLs via Anakin.
+        # A scraper outage must not abort research: fall back to Tavily snippets.
+        scraped, reddit_scraped = await asyncio.gather(
             self.firecrawl.scrape_urls(top_urls),
-            self.anakin.scrape_urls(reddit_urls)
+            self.anakin.scrape_urls(reddit_urls),
+            return_exceptions=True,
         )
+        if isinstance(scraped, BaseException):
+            logger.warning("[pipeline] Firecrawl batch failed: %s", scraped)
+            scraped = []
+        if isinstance(reddit_scraped, BaseException):
+            logger.warning("[pipeline] Anakin batch failed: %s", reddit_scraped)
+            reddit_scraped = []
 
         # Build lookup dicts keyed by URL for O(1) access
         scraped_urls = {s["url"]: s for s in scraped}
@@ -146,7 +159,7 @@ class ResearchPipeline:
                     })
                 else:
                     # Anakin failed for this URL — fall back to Tavily snippet
-                    print(f"[pipeline] Anakin scrape failed for {r['url']}, using Tavily snippet")
+                    logger.info("[pipeline] Anakin scrape failed for %s, using Tavily snippet", r["url"])
                     all_content.append(r)
             else:
                 full = scraped_urls.get(r["url"])
