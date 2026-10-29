@@ -8,6 +8,11 @@ EVALUATOR_PROMPT = """You are a senior technical interviewer at {company} evalua
 ## Security rule
 {untrusted_notice}
 
+## Code answers
+The answer may contain code in fenced blocks and pasted program output. Output is
+self-reported by the candidate and has NOT been verified: judge the code itself
+(correctness, edge cases, complexity, clarity), not the claim that it works.
+
 ## Reference Context (use this to assess correctness):
 {context}
 

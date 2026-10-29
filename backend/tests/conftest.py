@@ -197,15 +197,25 @@ def override_db(fake_db: FakeAsyncSession) -> Iterator[Callable[[Any], FakeAsync
             from main import app
             override_db(app)
     """
-    from db.postgres import get_db
+    from db.postgres import get_db, get_session_factory
 
     applied: list[Any] = []
+
+    class _FakeSessionContext:
+        """``async with factory() as session`` yielding the shared fake session."""
+
+        async def __aenter__(self) -> FakeAsyncSession:
+            return fake_db
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
 
     def apply(app: Any) -> FakeAsyncSession:
         async def _get_fake_db():
             yield fake_db
 
         app.dependency_overrides[get_db] = _get_fake_db
+        app.dependency_overrides[get_session_factory] = lambda: _FakeSessionContext
         applied.append(app)
         return fake_db
 
@@ -213,6 +223,7 @@ def override_db(fake_db: FakeAsyncSession) -> Iterator[Callable[[Any], FakeAsync
 
     for app in applied:
         app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_session_factory, None)
 
 
 @pytest.fixture

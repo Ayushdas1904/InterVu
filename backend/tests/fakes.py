@@ -44,6 +44,15 @@ class FakeGraph:
         self.state_values.update(result)
         return dict(self.state_values)
 
+    async def astream(self, state: Any, config: Any = None, stream_mode: str = "updates"):
+        """Like ainvoke, but yields LangGraph-style per-node updates first."""
+        self.invocations.append((state, config))
+        result = self.invoke_results.pop(0) if self.invoke_results else {}
+        self.state_values.update(result)
+        if "evaluation" in result:
+            yield {"evaluate_answer": {"evaluation": result["evaluation"]}}
+        yield {"generate_question": {k: v for k, v in result.items() if k.startswith("current_")}}
+
 
 DEFAULT_REPORT = {
     "overall_score": 72,

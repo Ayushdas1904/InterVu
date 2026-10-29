@@ -47,7 +47,9 @@ class PipelineProbe:
                 if probe.init_error is not None:
                     raise probe.init_error
 
-            async def run(self, company: str, role: str) -> dict:
+            async def run(self, company: str, role: str, on_stage: Any = None) -> dict:
+                if on_stage is not None:
+                    await on_stage("searching")
                 probe.runs += 1
                 if probe.error is not None:
                     raise probe.error

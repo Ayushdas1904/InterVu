@@ -60,7 +60,7 @@ class ResearchPipeline:
         ranked.sort(key=lambda x: x["relevance_score"],reverse=True)
         return ranked
 
-    async def run(self, company: str, role: str) -> dict[str, Any]:
+    async def run(self, company: str, role: str, on_stage: Any = None) -> dict[str, Any]:
         """
             Run the end-to-end research pipeline.
 
@@ -71,13 +71,21 @@ class ResearchPipeline:
             Args:
                 company: Target company name.
                 role: Target role being researched.
+                on_stage: Optional async callable ``await on_stage(name)`` called
+                    with "searching", "scraping", "extracting" and "indexing"
+                    as the pipeline advances (used to stream real progress).
 
             Returns:
                 Dictionary containing extracted interview preparation data,
                 including skills, technologies, interview topics, rounds,
                 behavioral patterns, difficulty, and key insights.
         """
+        async def stage(name: str) -> None:
+            if on_stage is not None:
+                await on_stage(name)
+
         # 1. Search
+        await stage("searching")
         search_results = await self.tavily.research(company, role)
 
         ranked_results = self.rank_results(search_results)
@@ -125,6 +133,7 @@ class ResearchPipeline:
             else:
                 top_urls.append(r["url"])
 
+        await stage("scraping")
         # 2. Scrape non-Reddit URLs via Firecrawl; Reddit URLs via Anakin.
         # A scraper outage must not abort research: fall back to Tavily snippets.
         scraped, reddit_scraped = await asyncio.gather(
@@ -172,11 +181,13 @@ class ResearchPipeline:
                     "metadata": full["metadata"],
                 })
 
+        await stage("extracting")
         # 3. Extract structured knowledge
         extracted =await self.extractor.extract(company, role, all_content)
 
         extracted = self.normalizer.normalize(extracted)
 
+        await stage("indexing")
         # 4. Embed and store in ChromaDB
         chunks_added = 0
         for item in all_content:

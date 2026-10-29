@@ -18,6 +18,7 @@ from config import ExtractorModel as model
 from prompts.extractor import EXTRACTOR_PROMPT
 from schemas.extractor import ExtractionResult
 from utils.groq_pool import GroqKeyPool
+from utils import usage
 from utils.llm_json import extract_json_object
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ class ExtractorAgent:
         )
         try:
             response = await self.llm.ainvoke(prompt)
+            usage.record("extractor", response, self.llm)
             validated = ExtractionResult(**extract_json_object(response))
             return validated.model_dump()
         except Exception as e:

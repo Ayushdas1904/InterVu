@@ -26,12 +26,20 @@ from utils.logging_setup import configure_logging, request_id_var  # noqa: E402
 
 configure_logging()
 
+from utils.observability import init_sentry  # noqa: E402
+
+# Before the app is created so the SDK can instrument it. No-op without SENTRY_DSN.
+init_sentry()
+
 from api.auth import router as auth_router  # noqa: E402
 from api.interview import router as interview_router  # noqa: E402
 from api.progress import router as progress_router  # noqa: E402
 from api.report import router as report_router  # noqa: E402
+from api.resume import router as resume_router  # noqa: E402
 from api.shares import owner_router as share_owner_router  # noqa: E402
 from api.shares import public_router as share_public_router  # noqa: E402
+from api.usage import router as usage_router  # noqa: E402
+from db.migrate import migrate_on_start, run_migrations  # noqa: E402
 from db.postgres import create_tables, engine  # noqa: E402
 from graph.interview_graph import close_graph, init_graph, is_graph_ready  # noqa: E402
 from utils.auth import auth_disabled, get_auth_secret, is_production  # noqa: E402
@@ -67,7 +75,10 @@ async def lifespan(app: FastAPI):
         get_auth_secret()  # Fail fast: raises when AUTH_SECRET is missing outside development.
     if auth_disabled():
         logger.warning("AUTH_DISABLED=true: bearer tokens are NOT enforced. Never use this outside local debugging.")
-    await create_tables()
+    if migrate_on_start():
+        await run_migrations()
+    else:
+        await create_tables()
     await init_graph()
     yield
     await close_graph()
@@ -139,7 +150,7 @@ app.add_middleware(
     allow_origins=cors_origins(),
     allow_credentials=False,  # Auth uses bearer tokens, not cookies.
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", REQUEST_ID_HEADER],
+    allow_headers=["Authorization", "Content-Type", "X-Filename", REQUEST_ID_HEADER],
     expose_headers=[REQUEST_ID_HEADER],
 )
 
@@ -149,6 +160,8 @@ app.include_router(report_router)
 app.include_router(share_owner_router)
 app.include_router(share_public_router)
 app.include_router(progress_router)
+app.include_router(resume_router)
+app.include_router(usage_router)
 app.include_router(auth_router)
 
 

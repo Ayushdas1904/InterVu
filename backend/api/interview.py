@@ -28,15 +28,19 @@ submitted while one is in flight gets 409.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.registry import blueprint_generator
-from db.postgres import Interview, Question, Report, Response, get_db
+from db.postgres import Interview, Question, Report, Response, get_db, get_session_factory
 from graph.interview_graph import InterviewState, get_compiled_graph, graph_config
 from pipeline import ResearchPipeline
 from research import (
@@ -52,6 +56,8 @@ from schemas.interiew import (
     SubmitAnswerRequest,
     SubmitAnswerResponse,
 )
+from services.resume import get_resume
+from services.usage import enforce_daily_limit, persist_usage
 from services.reports import (
     build_and_store_report,
     collect_qa_history,
@@ -59,6 +65,7 @@ from services.reports import (
     is_usable_report,
     isoformat,
 )
+from utils import usage
 from utils.auth import CurrentUser, get_current_user
 from utils.difficulty import normalize_difficulty
 from utils.locks import interview_locks
@@ -117,6 +124,74 @@ async def _mark_graph_complete(interview_id: int) -> None:
         logger.warning("Could not mark graph state complete for interview %s: %s", interview_id, exc)
 
 
+# Optional progress sink: ``await emit(event_name, data)``. None = not streaming.
+Emit = Callable[[str, dict[str, Any]], Awaitable[None]] | None
+
+# Strong references so fire-and-forget stream workers are not garbage collected.
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+SSE_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Accel-Buffering": "no",  # tell nginx-style proxies not to buffer the stream
+}
+
+
+async def _emit(emit: Emit, event: str, data: dict[str, Any]) -> None:
+    if emit is not None:
+        await emit(event, data)
+
+
+def _sse(event: str, data: dict[str, Any]) -> bytes:
+    """One Server-Sent Event frame."""
+    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n".encode()
+
+
+def _sse_response(
+    work: Callable[[Callable[[str, dict[str, Any]], Awaitable[None]]], Awaitable[dict[str, Any]]],
+    release: Callable[[], Awaitable[None]] | None = None,
+) -> StreamingResponse:
+    """
+    Run ``work(emit)`` in a background task and stream what it emits.
+
+    The task is detached from the HTTP connection on purpose: if the browser
+    disconnects mid-way, the interview step still finishes and is saved, so
+    the candidate's answer is never lost. The last event is either ``result``
+    (the final payload) or ``error`` ({status, detail}).
+    """
+    queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
+
+    async def emit(event: str, data: dict[str, Any]) -> None:
+        await queue.put((event, data))
+
+    async def runner() -> None:
+        try:
+            await queue.put(("result", await work(emit)))
+        except HTTPException as exc:
+            await queue.put(("error", {"status": exc.status_code, "detail": exc.detail}))
+        except Exception:  # noqa: BLE001 - never leave the client hanging
+            logger.exception("Streaming request failed.")
+            await queue.put(("error", {"status": 500, "detail": "Something went wrong while processing your request."}))
+        finally:
+            try:
+                if release is not None:
+                    await release()
+            finally:
+                await queue.put(None)
+
+    task = asyncio.create_task(runner())
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+    async def stream():
+        while True:
+            item = await queue.get()
+            if item is None:
+                return
+            yield _sse(*item)
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
 def _profile_to_extracted(profile: Any) -> dict[str, Any]:
     """The extractor-shaped dict for a stored ResearchProfile."""
     return {
@@ -131,7 +206,7 @@ def _profile_to_extracted(profile: Any) -> dict[str, Any]:
     }
 
 
-async def _run_research(company: str, role: str) -> dict[str, Any] | None:
+async def _run_research(company: str, role: str, emit: Emit = None) -> dict[str, Any] | None:
     """
     Run the research pipeline. Returns the extracted knowledge, or None when
     the pipeline could not even run (for example a missing API key), so the
@@ -139,7 +214,12 @@ async def _run_research(company: str, role: str) -> dict[str, Any] | None:
     """
     try:
         pipeline = ResearchPipeline()
-        result = await pipeline.run(company, role)
+
+        async def on_stage(name: str) -> None:
+            await _emit(emit, "stage", {"stage": name})
+
+        # Only pass the progress hook when someone is listening (streaming).
+        result = await (pipeline.run(company, role, on_stage=on_stage) if emit is not None else pipeline.run(company, role))
         return result["extracted"]
     except Exception:  # noqa: BLE001 - research is best-effort
         logger.exception("Research pipeline failed for %s / %s.", company, role)
@@ -155,20 +235,23 @@ def _blueprint_skills(blueprint: dict[str, Any] | None, limit: int = 4) -> list[
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
-@router.post("/start", response_model=StartInterviewResponse, dependencies=[Depends(limit_start)])
-async def start_interview(
+async def _do_start(
+    db: AsyncSession,
+    owner_id: int,
     body: StartInterviewRequest,
-    user: CurrentUser = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    emit: Emit = None,
 ) -> StartInterviewResponse:
     """
-    1. Check ResearchProfile cache
+    1. Check ResearchProfile cache (refresh it when stale)
     2. Run pipeline if cache miss
     3. Generate blueprint (using the requested difficulty, or the researched one)
     4. Initialize LangGraph state, retrieve context, generate first question
     5. Persist Interview + Question to DB
+
+    ``emit`` (streaming only) receives ``stage`` events as the work advances.
     """
-    owner_id = resolve_owner_id(body.user_id, user)
+    usage.begin()
+    await enforce_daily_limit(db, owner_id)
     company = body.company
     role = body.role
 
@@ -184,7 +267,7 @@ async def start_interview(
                 "Research profile for %s / %s is %s; refreshing.",
                 company, role, "being force-refreshed" if body.refresh_research else "stale",
             )
-            fresh = await _run_research(company, role)
+            fresh = await _run_research(company, role, emit)
             if fresh is not None and is_cacheable(fresh):
                 profile = await update_research_profile(db, profile, fresh)
                 extracted = _profile_to_extracted(profile)
@@ -197,7 +280,7 @@ async def start_interview(
             logger.info("Research profile found for %s / %s, skipping pipeline.", company, role)
     else:
         logger.info("No research profile for %s / %s, running pipeline.", company, role)
-        fresh = await _run_research(company, role)
+        fresh = await _run_research(company, role, emit)
         if fresh is not None and is_cacheable(fresh):
             extracted = fresh
             await save_research_profile(db, company, role, extracted)
@@ -216,6 +299,7 @@ async def start_interview(
     # The candidate's explicit choice wins over the researched estimate.
     difficulty = body.difficulty or normalize_difficulty(extracted.get("difficulty"))
 
+    await _emit(emit, "stage", {"stage": "planning"})
     blueprint = await blueprint_generator.generate(
         company=company,
         role=role,
@@ -235,6 +319,8 @@ async def start_interview(
         # generic script with no AI behind it. Fail fast with a clear message
         # instead of silently starting a degraded session.
         logger.error("Refusing to start an interview for %s / %s: research and planner both failed.", company, role)
+        await persist_usage(db, owner_id, None)  # the failed attempts still cost tokens
+        await db.commit()
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
@@ -246,6 +332,16 @@ async def start_interview(
     if warnings:
         # Persisted with the blueprint so a resumed interview still shows the notice.
         blueprint = {**blueprint, "degraded": True, "warnings": list(warnings)}
+
+    candidate_background = ""
+    if body.use_resume:
+        resume = await get_resume(db, owner_id)
+        if resume is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No resume is stored for your account. Upload one first, or start without it.",
+            )
+        candidate_background = resume.text
 
     interview = Interview(
         user_id=owner_id,
@@ -265,6 +361,7 @@ async def start_interview(
         "difficulty": difficulty,
         "username": body.username,
         "blueprint": blueprint,
+        "candidate_background": candidate_background,
         "context": "",
         "current_question": "",
         "current_question_type": "",
@@ -279,6 +376,7 @@ async def start_interview(
         "interview_complete": False,
     }
 
+    await _emit(emit, "stage", {"stage": "starting"})
     compiled_graph = get_compiled_graph()
     state = await compiled_graph.ainvoke(initial_state, config=graph_config(interview.id))
 
@@ -296,6 +394,7 @@ async def start_interview(
 
     db.add(question)
     await db.flush()
+    await persist_usage(db, owner_id, interview.id)
     await db.commit()  # Persist before the response is sent (see "Persistence" above).
 
     return StartInterviewResponse(
@@ -306,6 +405,38 @@ async def start_interview(
         degraded=bool(warnings),
         warnings=warnings,
     )
+
+
+
+
+@router.post("/start", response_model=StartInterviewResponse, dependencies=[Depends(limit_start)])
+async def start_interview(
+    body: StartInterviewRequest,
+    user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> StartInterviewResponse:
+    """Start an interview and return once the first question is ready."""
+    return await _do_start(db, resolve_owner_id(body.user_id, user), body)
+
+
+@router.post("/start/stream", dependencies=[Depends(limit_start)])
+async def start_interview_stream(
+    body: StartInterviewRequest,
+    user: CurrentUser = Depends(get_current_user),
+    session_factory: Any = Depends(get_session_factory),
+) -> StreamingResponse:
+    """
+    Same as ``POST /start`` but streams real progress as Server-Sent Events:
+    ``stage`` (searching, scraping, extracting, indexing, planning, starting),
+    then ``result`` (the StartInterviewResponse) or ``error`` ({status, detail}).
+    """
+    owner_id = resolve_owner_id(body.user_id, user)
+
+    async def work(emit: Callable[[str, dict[str, Any]], Awaitable[None]]) -> dict[str, Any]:
+        async with session_factory() as session:
+            return (await _do_start(session, owner_id, body, emit)).model_dump()
+
+    return _sse_response(work)
 
 
 @router.get("/{interview_id}")
@@ -391,8 +522,19 @@ async def submit_answer(
         return await _advance_with_answer(db, interview, body.answer)
 
 
-async def _advance_with_answer(db: AsyncSession, interview: Interview, answer: str) -> SubmitAnswerResponse:
-    """Body of POST /answer; runs under the interview's lock."""
+async def _advance_with_answer(
+    db: AsyncSession,
+    interview: Interview,
+    answer: str,
+    emit: Emit = None,
+) -> SubmitAnswerResponse:
+    """
+    Body of POST /answer; runs under the interview's lock. With ``emit`` it
+    streams: an ``evaluation`` event as soon as the answer is scored, before
+    the next question exists.
+    """
+    usage.ensure()
+    await enforce_daily_limit(db, interview.user_id)
     config = graph_config(interview.id)
     compiled_graph = get_compiled_graph()
     current_state = await compiled_graph.aget_state(config)
@@ -404,7 +546,17 @@ async def _advance_with_answer(db: AsyncSession, interview: Interview, answer: s
 
     await compiled_graph.aupdate_state(config, {"current_answer": answer})
 
-    final_state = await compiled_graph.ainvoke(None, config=config)
+    if emit is None:
+        final_state = await compiled_graph.ainvoke(None, config=config)
+    else:
+        await emit("stage", {"stage": "evaluating"})
+        async for chunk in compiled_graph.astream(None, config=config, stream_mode="updates"):
+            update = chunk.get("evaluate_answer") if isinstance(chunk, dict) else None
+            if isinstance(update, dict) and update.get("evaluation"):
+                await emit("evaluation", {"evaluation": update["evaluation"]})
+                await emit("stage", {"stage": "preparing_next"})
+        snapshot = await compiled_graph.aget_state(config)
+        final_state = dict(getattr(snapshot, "values", None) or {})
 
     evaluation = final_state.get("evaluation", {}) or {}
     interview_complete = bool(final_state.get("interview_complete", False))
@@ -431,6 +583,7 @@ async def _advance_with_answer(db: AsyncSession, interview: Interview, answer: s
     next_question = None
     next_section = None
     next_acknowledgment = None
+    next_q_type = None
     report_ready = False
 
     if not interview_complete:
@@ -453,6 +606,7 @@ async def _advance_with_answer(db: AsyncSession, interview: Interview, answer: s
     else:
         interview.status = "completed"
         await db.flush()
+        await _emit(emit, "stage", {"stage": "report"})
         # Generate the report now. A failure here must never lose the saved
         # Response: it runs in a SAVEPOINT and GET /api/reports/{id} will
         # lazily generate the report later if needed. A fallback (placeholder)
@@ -465,6 +619,7 @@ async def _advance_with_answer(db: AsyncSession, interview: Interview, answer: s
         except Exception:  # noqa: BLE001
             logger.exception("Report generation failed for interview %s; it will be generated lazily.", interview.id)
 
+    await persist_usage(db, interview.user_id, interview.id)  # no-op if the report step already saved it
     await db.commit()  # Persist before the response is sent (see "Persistence" above).
 
     return SubmitAnswerResponse(
@@ -474,7 +629,58 @@ async def _advance_with_answer(db: AsyncSession, interview: Interview, answer: s
         next_acknowledgment=next_acknowledgment,
         interview_complete=interview_complete,
         report_ready=report_ready,
+        next_question_type=next_q_type if not interview_complete else None,
     )
+
+
+@router.post("/{interview_id}/answer/stream")
+async def submit_answer_stream(
+    interview_id: int,
+    body: SubmitAnswerRequest,
+    user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    session_factory: Any = Depends(get_session_factory),
+) -> StreamingResponse:
+    """
+    Same as ``POST /answer`` but streamed as Server-Sent Events: ``stage``
+    (evaluating, preparing_next, report), ``evaluation`` (your score, sent as
+    soon as it exists), then ``result`` (the SubmitAnswerResponse) or
+    ``error`` ({status, detail}). Problems that can be detected up front (not
+    your interview, already completed, another answer in flight) are normal
+    HTTP errors before any streaming starts.
+    """
+    interview = await get_owned_interview_or_404(interview_id, db, user)
+    if interview.status == "completed":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Interview already completed")
+    if interview_locks.is_locked(interview.id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An answer for this interview is still being processed. Please wait for it to finish.",
+        )
+
+    # Take the lock here, with no await between the check above and the
+    # acquire (an uncontended acquire does not suspend), and hand it to the
+    # background worker, which releases it when the step is fully saved.
+    lock = interview_locks.hold(interview.id)
+    await lock.__aenter__()
+    answer = body.answer
+    interview_pk = interview.id
+
+    async def work(emit: Callable[[str, dict[str, Any]], Awaitable[None]]) -> dict[str, Any]:
+        async with session_factory() as session:
+            fresh = await session.get(Interview, interview_pk)
+            if fresh is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview not found")
+            return (await _advance_with_answer(session, fresh, answer, emit)).model_dump()
+
+    async def release() -> None:
+        await lock.__aexit__(None, None, None)
+
+    try:
+        return _sse_response(work, release)
+    except BaseException:
+        await release()
+        raise
 
 
 @router.post("/{interview_id}/complete")

@@ -16,6 +16,7 @@ Environment:
     RATE_LIMIT_LOGIN_PER_MIN    Login attempts per client IP per minute (default 10).
     RATE_LIMIT_START_PER_HOUR   Interview starts per user per hour (default 20).
     RATE_LIMIT_PUBLIC_PER_MIN   Shared-report views per client IP per minute (default 60).
+    RATE_LIMIT_UPLOAD_PER_HOUR  Resume uploads per user per hour (default 10).
     RATE_LIMIT_ENABLED          "true"/"false" to force limiting on or off.
                                 Default: on, except when ENV=test.
     A limit of 0 disables that limit.
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_LOGIN_PER_MIN = 10
 DEFAULT_START_PER_HOUR = 20
 DEFAULT_PUBLIC_PER_MIN = 60
+DEFAULT_UPLOAD_PER_HOUR = 10
 # Upper bound on tracked keys; stale keys are pruned before this is reached.
 MAX_TRACKED_KEYS = 10_000
 
@@ -166,3 +168,15 @@ async def limit_public(request: Request) -> None:
         return
     limit = _env_limit("RATE_LIMIT_PUBLIC_PER_MIN", DEFAULT_PUBLIC_PER_MIN)
     _enforce(("public", client_ip(request)), limit, 60.0, "shared-report")
+
+
+async def limit_upload(
+    request: Request,
+    user: CurrentUser = Depends(get_current_user),
+) -> None:
+    """FastAPI dependency: RATE_LIMIT_UPLOAD_PER_HOUR per authenticated user."""
+    if not rate_limiting_enabled():
+        return
+    limit = _env_limit("RATE_LIMIT_UPLOAD_PER_HOUR", DEFAULT_UPLOAD_PER_HOUR)
+    subject: Hashable = ("user", user.id) if user.id is not None else ("ip", client_ip(request))
+    _enforce(("upload", subject), limit, 3600.0, "resume upload")

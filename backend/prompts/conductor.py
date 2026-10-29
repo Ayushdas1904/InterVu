@@ -31,6 +31,8 @@ do not paraphrase, abbreviate, or invent a new name):
 ## Retrieved Context (grounds your questions in real interview data for this company/role)
 {context}
 
+{candidate_background_section}
+
 ## Difficulty Level: {difficulty}
 
 ## Conversation So Far

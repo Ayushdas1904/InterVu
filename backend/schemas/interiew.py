@@ -22,6 +22,9 @@ class StartInterviewRequest(BaseModel):
     difficulty: str | None = None
     # Re-run the research pipeline even when a fresh cached profile exists.
     refresh_research: bool = False
+    # Tailor questions to the candidate's stored resume text (opt-in; the text
+    # is sent to the AI provider for this interview).
+    use_resume: bool = False
 
     @field_validator("username", "company", "role", mode="before")
     @classmethod
@@ -71,3 +74,5 @@ class SubmitAnswerResponse(BaseModel):
     interview_complete: bool
     next_acknowledgment: str | None
     report_ready: bool = False
+    # "technical" | "behavioral" | "coding": lets the UI offer the code editor.
+    next_question_type: str | None = None

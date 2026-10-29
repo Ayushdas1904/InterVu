@@ -11,6 +11,8 @@ Schema:
   - reports
   - research_profiles
   - report_shares   (opt-in public read-only links to a report)
+  - resumes         (extracted text of a candidate's resume, one per user)
+  - llm_usage       (token counts per LLM call, for cost tracking and limits)
 
 Environment:
   DATABASE_URL  SQLAlchemy async URL (postgresql+asyncpg://...).
@@ -117,7 +119,7 @@ def build_ssl_connect_arg(mode: str, root_cert: str | None = None) -> Any:
     return context
 
 
-def _connect_args() -> dict[str, Any]:
+def connect_args() -> dict[str, Any]:
     mode = ssl_mode(DATABASE_URL, os.getenv("DB_SSL"))
     ssl_arg = build_ssl_connect_arg(mode, os.getenv("DB_SSL_ROOT_CERT", "").strip() or None)
     return {} if ssl_arg is None else {"ssl": ssl_arg}
@@ -278,13 +280,52 @@ class ReportShare(Base):
     interview = relationship("Interview", back_populates="share")
 
 
+class Resume(Base):
+    """
+    The extracted TEXT of a candidate's resume (the uploaded file itself is
+    never stored). One row per user; used only when the candidate opts in when
+    starting an interview, and deletable at any time.
+    """
+
+    __tablename__ = "resumes"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    filename = Column(String(255), nullable=False)
+    content_type = Column(String(100), nullable=False)
+    text = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    updated_at = Column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+
+class LlmUsage(Base):
+    """Token counts of one LLM call. ``interview_id`` is NULL for calls made before an interview existed."""
+
+    __tablename__ = "llm_usage"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    interview_id = Column(
+        Integer, ForeignKey("interviews.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    label = Column(String(50), nullable=False)  # conductor | evaluator | feedback | blueprint | extractor
+    model = Column(String(100), nullable=True)
+    input_tokens = Column(Integer, nullable=False, default=0)
+    output_tokens = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), default=_utcnow, index=True)
+
+
 # ── Engine & Session ───────────────────────────────────────────────────────────
 
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
     pool_pre_ping=True,
-    connect_args=_connect_args(),
+    connect_args=connect_args(),
 )
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -298,6 +339,16 @@ async def get_db() -> AsyncIterator[AsyncSession]:
         except Exception:
             await session.rollback()
             raise
+
+
+def get_session_factory() -> Any:
+    """
+    FastAPI dependency returning a callable that opens a NEW session
+    (``async with factory() as session``). Streaming endpoints finish their
+    work in a background task that can outlive the request, so they must not
+    reuse the request's session; tests override this with a fake.
+    """
+    return AsyncSessionLocal
 
 
 async def create_tables() -> None:

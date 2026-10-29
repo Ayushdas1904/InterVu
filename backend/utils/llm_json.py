@@ -24,6 +24,8 @@ import os
 import re
 from typing import Any, Awaitable, Callable, Iterator, TypeVar
 
+from utils import usage
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -207,6 +209,8 @@ async def invoke_llm_json(
 
     async def _once() -> Any:
         response = await llm.ainvoke(prompt)
+        # Count tokens before parsing: a reply that fails validation still cost money.
+        usage.record(label, response, llm)
         data = extract_json_object(response)
         return validate(data) if validate is not None else data
 

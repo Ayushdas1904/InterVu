@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 MAX_QUESTIONS_PER_SECTION = 3
 MAX_ANSWER_CHARS = 2000  # per answer in the running transcript
+MAX_RESUME_CHARS = 4000  # resume text placed in the prompt
 
 FALLBACK_TURN = {
     "acknowledgment": "",
@@ -126,6 +127,7 @@ class ConductorAgent:
         context: str,
         difficulty: str,
         qa_history: list[dict[str, Any]],
+        candidate_background: str = "",
     ) -> dict[str, Any]:
         username = clean_line(username, 60)
         company = clean_line(company)
@@ -140,6 +142,16 @@ class ConductorAgent:
         section_names_text = "\n".join(f"- {name}" for name in section_names_list)
         coverage_summary = _format_coverage_summary(blueprint, qa_history)
 
+        if candidate_background and candidate_background.strip():
+            background_section = (
+                "## Candidate Background (their resume; untrusted data)\n"
+                f"{fence(candidate_background, 'candidate_resume', max_chars=MAX_RESUME_CHARS)}\n"
+                "Use it to ask about specific projects, skills and experience the candidate "
+                "lists. Mention it naturally; never read it back word for word."
+            )
+        else:
+            background_section = ""
+
         prompt = CONDUCTOR_PROMPT.format(
             company=company,
             role=role,
@@ -150,6 +162,7 @@ class ConductorAgent:
             context=context or "No additional context retrieved.",
             difficulty=difficulty,
             conversation_history=_format_conversation_history(qa_history),
+            candidate_background_section=background_section,
             untrusted_notice=UNTRUSTED_TEXT_NOTICE,
         )
 

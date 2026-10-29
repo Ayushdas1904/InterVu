@@ -18,6 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agents.registry import feedback_agent
 from db.postgres import Interview, Question, Report, Response
 from graph import interview_graph
+from services.usage import persist_usage
+from utils import usage
 
 logger = logging.getLogger(__name__)
 
@@ -104,11 +106,13 @@ async def build_and_store_report(
     so they never count as a real zero, and callers treat them as "no report
     yet" so they are regenerated on the next request.
     """
+    usage.ensure()  # keeps records already collected by the caller (for example /answer)
     report_data = await feedback_agent.generate_report(
         company=interview.company,
         role=interview.role,
         qa_pairs=qa_history,
     )
+    await persist_usage(db, interview.user_id, interview.id)
     overall_score = None if report_data.get("fallback") else report_data.get("overall_score", 0)
 
     report = await get_report_row(db, interview.id)

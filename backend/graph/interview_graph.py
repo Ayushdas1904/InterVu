@@ -58,6 +58,9 @@ class InterviewState(TypedDict):
     # Blueprint
     blueprint: dict[str, Any]
 
+    # Optional resume text (opt-in, untrusted); "" when not used.
+    candidate_background: str
+
     # Current turn
     context: str
     current_question: str
@@ -155,6 +158,7 @@ async def generate_question(state: InterviewState) -> dict[str, Any]:
         blueprint=state["blueprint"],
         difficulty=state["difficulty"],
         qa_history=state["qa_history"],
+        candidate_background=state.get("candidate_background", ""),
     )
 
     return {
