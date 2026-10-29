@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import AppShell from "@/components/layout/app-shell";
 import ScoreRing from "@/components/ui/score-ring";
+import SharePanel from "@/components/ui/share-panel";
 import {
   ArrowRight, CheckCircle2, AlertCircle, BookOpen,
   TrendingUp, ChevronRight, BarChart3, ArrowLeft,
@@ -407,6 +408,9 @@ export default function ReportPage() {
             </div>
           </div>
         )}
+
+        {/* ── Share (only real reports can be shared) ── */}
+        {!body.fallback && <SharePanel interviewId={interviewId} />}
 
         {/* ── Actions ── */}
         <div className="report-actions no-print" style={{ display: "flex", gap: "12px" }}>

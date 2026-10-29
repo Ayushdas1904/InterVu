@@ -11,6 +11,7 @@ import {
   api, errorMessage, isApiError,
   type Evaluation, type InterviewDetail,
 } from "@/lib/api";
+import NoticeBanner from "@/components/ui/notice-banner";
 
 type Message = {
   role: "interviewer" | "user";
@@ -80,6 +81,8 @@ export default function InterviewPage() {
   const [ending, setEnding] = useState(false);
   const [endError, setEndError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  // Server-reported degradations (research or planner unavailable at start).
+  const [notices, setNotices] = useState<string[]>([]);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -101,6 +104,7 @@ export default function InterviewPage() {
           totalQuestions: totalPlannedQuestions(data),
         });
         setComplete(data.status === "completed");
+        setNotices(data.blueprint?.warnings ?? []);
         setLoadState("ready");
       })
       .catch((e) => {
@@ -334,6 +338,8 @@ export default function InterviewPage() {
         </header>
 
         <div style={{ flex: 1, overflowY: "auto", padding: "28px", display: "flex", flexDirection: "column", gap: "20px" }}>
+          <NoticeBanner title="This interview is running in a reduced mode" messages={notices} />
+
           {messages.length === 0 && (
             <p style={{ fontSize: "13px", color: "var(--text-muted)" }}>No questions in this interview yet.</p>
           )}

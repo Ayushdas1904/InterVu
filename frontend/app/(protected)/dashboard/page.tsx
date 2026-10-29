@@ -6,6 +6,7 @@ import AppShell from "@/components/layout/app-shell";
 import StatCard from "@/components/ui/stat-card";
 import InterviewCard from "@/components/ui/interview-card";
 import CommandPalette from "@/components/ui/command-palette";
+import ProgressInsights from "@/components/ui/progress-insights";
 import {
   Mic2,
   BarChart3,
@@ -21,7 +22,7 @@ import {
 import {
   ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid,
 } from "recharts";
-import { api, auth, errorMessage, type InterviewSummary } from "@/lib/api";
+import { api, auth, errorMessage, type InterviewSummary, type ProgressResponse } from "@/lib/api";
 
 const shortDate = (iso: string) =>
   new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
@@ -35,6 +36,8 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  // Optional analytics panel: a failure here must never block the dashboard.
+  const [progress, setProgress] = useState<ProgressResponse | null>(null);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -67,6 +70,17 @@ export default function DashboardPage() {
     return () => {
       cancelled = true;
     };
+  }, [reloadKey]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    api.progress
+      .get(controller.signal)
+      .then(setProgress)
+      .catch((err) => {
+        if (!controller.signal.aborted) console.warn("Progress insights unavailable:", err);
+      });
+    return () => controller.abort();
   }, [reloadKey]);
 
   const retry = () => {
@@ -377,6 +391,9 @@ export default function DashboardPage() {
             />
           </div>
         )}
+
+        {/* ── Where to focus ── */}
+        {!loading && progress && <ProgressInsights data={progress} />}
 
         {/* ── Score trend ── */}
         {!loading && scored.length > 0 && (

@@ -81,7 +81,7 @@ function parseDetail(text: string, status: number): string {
 // ── Core request ──────────────────────────────────────────────────────────────
 
 type RequestOptions = {
-  method?: "GET" | "POST";
+  method?: "GET" | "POST" | "DELETE";
   body?: unknown;
   /** Send the bearer token (default true). */
   authenticated?: boolean;
@@ -166,6 +166,10 @@ export type BlueprintSection = {
 
 export type Blueprint = {
   sections: BlueprintSection[];
+  /** True when part of the pipeline fell back to defaults (see `warnings`). */
+  degraded?: boolean;
+  /** Plain-language notices about what could not be done (research, planner). */
+  warnings?: string[];
 };
 
 export type StartInterviewResponse = {
@@ -173,6 +177,8 @@ export type StartInterviewResponse = {
   first_question: string;
   blueprint: Blueprint;
   difficulty: string;
+  degraded: boolean;
+  warnings: string[];
 };
 
 export type Evaluation = {
@@ -289,6 +295,47 @@ export type GenerateReportResponse = {
   report: ReportBody;
 };
 
+export type ShareStatus =
+  | { shared: false }
+  | {
+      shared: true;
+      token: string;
+      /** Frontend path of the public page, e.g. /shared/<token>. */
+      path: string;
+      created_at: string;
+      expires_at: string;
+    };
+
+/** What an anonymous visitor sees through a share link (no names, answers or ids). */
+export type SharedReport = {
+  company: string;
+  role: string;
+  difficulty: string | null;
+  overall_score: number | null;
+  report: Partial<Pick<ReportBody, "summary" | "strong_topics" | "weak_topics" | "section_scores" | "recommendations">>;
+  created_at: string;
+  expires_at: string;
+};
+
+export type TopicCount = { topic: string; count: number };
+
+export type ProgressResponse = {
+  total_interviews: number;
+  reports_count: number;
+  average_score: number | null;
+  best_score: number | null;
+  latest_score: number | null;
+  /** Latest minus first score; null until two scored interviews exist. */
+  improvement: number | null;
+  trend: { interview_id: number; company: string; role: string; date: string | null; score: number }[];
+  /** Weakest section first. Scores are 0-10. */
+  section_averages: { section: string; average: number; count: number }[];
+  weak_topics: TopicCount[];
+  strong_topics: TopicCount[];
+  by_company: { company: string; count: number; average: number }[];
+  practice_next: string[];
+};
+
 export type InterviewSummary = {
   id: number;
   company: string;
@@ -312,6 +359,8 @@ export const api = {
       role: string;
       /** Omit (or "auto") to use the researched difficulty. */
       difficulty?: Difficulty | "auto";
+      /** Re-run company research even if a fresh cached profile exists. */
+      refresh_research?: boolean;
     }) =>
       request<StartInterviewResponse>("/api/interviews/start", {
         method: "POST",
@@ -362,6 +411,33 @@ export const api = {
       request<GenerateReportResponse>(`/api/reports/${interviewId}`, {
         method: "POST",
         timeoutMs: LLM_TIMEOUT_MS,
+      }),
+
+    share: {
+      get: (interviewId: number) => request<ShareStatus>(`/api/reports/${interviewId}/share`),
+
+      /** Creates a public read-only link (or returns the active one). */
+      create: (interviewId: number, expiresInDays?: number) =>
+        request<Extract<ShareStatus, { shared: true }>>(`/api/reports/${interviewId}/share`, {
+          method: "POST",
+          body: expiresInDays ? { expires_in_days: expiresInDays } : {},
+        }),
+
+      revoke: (interviewId: number) =>
+        request<ShareStatus>(`/api/reports/${interviewId}/share`, { method: "DELETE" }),
+    },
+  },
+
+  progress: {
+    get: (signal?: AbortSignal) => request<ProgressResponse>("/api/progress", { signal }),
+  },
+
+  shared: {
+    /** Public: no sign-in, the token in the link is the credential. */
+    get: (token: string, signal?: AbortSignal) =>
+      request<SharedReport>(`/api/shared/${encodeURIComponent(token)}`, {
+        authenticated: false,
+        signal,
       }),
   },
 
