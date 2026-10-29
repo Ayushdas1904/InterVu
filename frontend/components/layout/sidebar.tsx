@@ -18,7 +18,7 @@ const NAV_ITEMS = [
   { href: "/dashboard",       label: "Dashboard",        icon: LayoutDashboard },
   { href: "/interview/new",   label: "New Interview",    icon: Mic2 },
   { href: "/dashboard",       label: "Reports",          icon: FileText,    match: "/report" },
-  { href: "/dashboard",       label: "Resume Analysis",  icon: FileSearch,  disabled: true },
+  { href: "/resume",          label: "Resume",           icon: FileSearch },
   { href: "/dashboard",       label: "Settings",         icon: Settings,    disabled: true },
 ];
 

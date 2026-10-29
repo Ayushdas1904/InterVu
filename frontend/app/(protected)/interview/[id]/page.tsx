@@ -4,14 +4,16 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { useRouter, useParams } from "next/navigation";
 import Link from "next/link";
 import {
-  Zap, ChevronRight, CheckCircle2, Send,
+  Zap, ChevronRight, CheckCircle2, Send, Code2, Mic, MicOff, Volume2, VolumeX,
   ArrowRight, BarChart3, LogOut, AlertTriangle, RotateCcw,
 } from "lucide-react";
 import {
   api, errorMessage, isApiError,
-  type Evaluation, type InterviewDetail,
+  type AnswerStage, type Evaluation, type InterviewDetail,
 } from "@/lib/api";
 import NoticeBanner from "@/components/ui/notice-banner";
+import CodeEditor from "@/components/ui/code-editor";
+import { useVoice } from "@/hooks/useVoice";
 
 type Message = {
   role: "interviewer" | "user";
@@ -83,6 +85,16 @@ export default function InterviewPage() {
   const [reloadKey, setReloadKey] = useState(0);
   // Server-reported degradations (research or planner unavailable at start).
   const [notices, setNotices] = useState<string[]>([]);
+  // Live progress of the answer being processed (streamed from the server).
+  const [phase, setPhase] = useState<AnswerStage | null>(null);
+  const [liveScore, setLiveScore] = useState<number | null>(null);
+  // Type of the question currently being answered ("coding" | "technical" | "behavioral").
+  const [currentType, setCurrentType] = useState<string | null>(null);
+  const [showEditor, setShowEditor] = useState(false);
+
+  const voice = useVoice(
+    useCallback((text: string) => setAnswer((prev) => (prev ? `${prev} ${text}` : text)), []),
+  );
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -105,6 +117,7 @@ export default function InterviewPage() {
         });
         setComplete(data.status === "completed");
         setNotices(data.blueprint?.warnings ?? []);
+        setCurrentType(data.status === "completed" ? null : data.current_question_type);
         setLoadState("ready");
       })
       .catch((e) => {
@@ -123,7 +136,15 @@ export default function InterviewPage() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, submitting]);
+  }, [messages, submitting, phase]);
+
+  // Grow the answer box when text is added programmatically (dictation, code).
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, [answer]);
 
   const goToReport = useCallback(() => {
     router.push(`/report/${interviewId}`);
@@ -140,14 +161,22 @@ export default function InterviewPage() {
     if (!text || submittingRef.current || complete || sessionLost) return;
 
     submittingRef.current = true;
+    voice.stopListening();
     setSubmitting(true);
+    setPhase("evaluating");
+    setLiveScore(null);
+    setShowEditor(false);
     setSubmitError(null);
     setMessages((prev) => [...prev, { role: "user", content: text }]);
     setAnswer("");
     if (textareaRef.current) textareaRef.current.style.height = "auto";
 
     try {
-      const res = await api.interviews.submitAnswer(interviewId, text);
+      const res = await api.interviews.submitAnswerStream(interviewId, text, {
+        onStage: setPhase,
+        // The score arrives before the next question exists: show it right away.
+        onEvaluation: (ev) => setLiveScore(typeof ev.score === "number" ? ev.score : null),
+      });
       setAnsweredCount((c) => c + 1);
 
       if (res.interview_complete) {
@@ -170,6 +199,8 @@ export default function InterviewPage() {
         ...prev,
         { role: "interviewer", content: combinedText, evaluation: res.evaluation },
       ]);
+      setCurrentType(res.next_question_type ?? null);
+      voice.say(combinedText);
     } catch (e) {
       console.error("Failed to submit answer:", e);
       setMessages((prev) => prev.slice(0, -1));
@@ -190,6 +221,8 @@ export default function InterviewPage() {
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
+      setPhase(null);
+      setLiveScore(null);
     }
   };
 
@@ -449,7 +482,13 @@ export default function InterviewPage() {
                 <Zap size={12} color="white" fill="white" />
               </div>
               <div style={{ padding: "14px 18px", borderRadius: "4px 18px 18px 18px", background: "var(--surface-1)", border: "1px solid var(--border-subtle)", display: "flex", alignItems: "center", gap: "8px" }}>
-                <span style={{ fontSize: "13px", color: "var(--text-muted)" }}>Evaluating</span>
+                <span id="answer-progress" style={{ fontSize: "13px", color: "var(--text-muted)" }}>
+                  {phase === "preparing_next"
+                    ? `${liveScore !== null ? `Scored ${liveScore.toFixed(1)}/10. ` : ""}Preparing your next question`
+                    : phase === "report"
+                    ? "Writing your feedback report"
+                    : "Evaluating"}
+                </span>
                 <div style={{ display: "flex", gap: "4px" }}>
                   <div className="typing-dot" />
                   <div className="typing-dot" />
@@ -515,6 +554,17 @@ export default function InterviewPage() {
               {submitError && (
                 <p role="alert" style={{ fontSize: "12.5px", color: "#EF4444", marginBottom: "8px" }}>{submitError}</p>
               )}
+              {showEditor && (
+                <CodeEditor
+                  disabled={inputDisabled}
+                  onClose={() => setShowEditor(false)}
+                  onInsert={(text) => {
+                    setAnswer((prev) => (prev.trim() ? `${prev.replace(/\s+$/, "")}\n\n${text}` : text));
+                    setShowEditor(false);
+                    textareaRef.current?.focus();
+                  }}
+                />
+              )}
               <div style={{
                 display: "flex", alignItems: "flex-end", gap: "10px",
                 background: "var(--surface-1)", border: "1px solid var(--border-default)",
@@ -545,6 +595,45 @@ export default function InterviewPage() {
                 />
                 <div style={{ display: "flex", gap: "6px", alignItems: "center", flexShrink: 0 }}>
                   <button
+                    id="toggle-editor-btn"
+                    type="button"
+                    aria-label={showEditor ? "Hide code editor" : "Write code"}
+                    aria-pressed={showEditor}
+                    title="Write code"
+                    onClick={() => setShowEditor((v) => !v)}
+                    disabled={inputDisabled}
+                    style={{ ...iconButtonStyle, ...(currentType === "coding" && !showEditor ? { border: "1px solid rgba(104,169,186,0.6)", color: "#68a9ba" } : {}) }}
+                  >
+                    <Code2 size={15} />
+                  </button>
+                  {voice.support.speak && (
+                    <button
+                      id="toggle-read-aloud-btn"
+                      type="button"
+                      aria-label={voice.readAloud ? "Stop reading questions aloud" : "Read questions aloud"}
+                      aria-pressed={voice.readAloud}
+                      title="Read questions aloud"
+                      onClick={() => voice.setReadAloud(!voice.readAloud)}
+                      style={{ ...iconButtonStyle, ...(voice.readAloud ? { border: "1px solid rgba(104,169,186,0.6)", color: "#68a9ba" } : {}) }}
+                    >
+                      {voice.readAloud ? <Volume2 size={15} /> : <VolumeX size={15} />}
+                    </button>
+                  )}
+                  {voice.support.dictate && (
+                    <button
+                      id="toggle-dictation-btn"
+                      type="button"
+                      aria-label={voice.listening ? "Stop dictation" : "Dictate your answer"}
+                      aria-pressed={voice.listening}
+                      title="Dictate your answer"
+                      onClick={voice.toggleListening}
+                      disabled={inputDisabled}
+                      style={{ ...iconButtonStyle, ...(voice.listening ? { border: "1px solid rgba(239,68,68,0.6)", color: "#EF4444" } : {}) }}
+                    >
+                      {voice.listening ? <MicOff size={15} /> : <Mic size={15} />}
+                    </button>
+                  )}
+                  <button
                     id="submit-answer-btn"
                     aria-label="Submit answer"
                     onClick={handleSubmit}
@@ -564,6 +653,14 @@ export default function InterviewPage() {
               </div>
             </>
           )}
+          {(voice.listening || voice.error) && (
+            <p id="voice-status" role="status" style={{ fontSize: "11.5px", color: voice.error ? "#EF4444" : "var(--text-secondary)", textAlign: "center", marginTop: "8px" }}>
+              {voice.error ??
+                (voice.interim
+                  ? `Listening: ${voice.interim}`
+                  : "Listening... Dictation uses your browser's speech service (in Chrome, audio is sent to Google). InterVu never receives audio.")}
+            </p>
+          )}
           <p className="chat-input-hint" style={{ fontSize: "11px", color: "var(--text-muted)", textAlign: "center", marginTop: "8px" }}>
             Enter to send · Shift+Enter for new line
           </p>
@@ -578,5 +675,12 @@ const secondaryButtonStyle: React.CSSProperties = {
   padding: "10px 16px", borderRadius: "10px",
   background: "var(--surface-1)", border: "1px solid var(--border-default)",
   color: "var(--text-secondary)", fontSize: "13px", fontWeight: 600,
+  cursor: "pointer", fontFamily: "inherit",
+};
+
+const iconButtonStyle: React.CSSProperties = {
+  width: "36px", height: "36px", borderRadius: "10px",
+  background: "var(--surface-2)", border: "1px solid var(--border-default)",
+  color: "var(--text-muted)", display: "flex", alignItems: "center", justifyContent: "center",
   cursor: "pointer", fontFamily: "inherit",
 };

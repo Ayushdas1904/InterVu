@@ -7,6 +7,7 @@ import StatCard from "@/components/ui/stat-card";
 import InterviewCard from "@/components/ui/interview-card";
 import CommandPalette from "@/components/ui/command-palette";
 import ProgressInsights from "@/components/ui/progress-insights";
+import UsageCard from "@/components/ui/usage-card";
 import {
   Mic2,
   BarChart3,
@@ -22,7 +23,7 @@ import {
 import {
   ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid,
 } from "recharts";
-import { api, auth, errorMessage, type InterviewSummary, type ProgressResponse } from "@/lib/api";
+import { api, auth, errorMessage, type InterviewSummary, type ProgressResponse, type UsageResponse } from "@/lib/api";
 
 const shortDate = (iso: string) =>
   new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
@@ -38,6 +39,7 @@ export default function DashboardPage() {
   const [reloadKey, setReloadKey] = useState(0);
   // Optional analytics panel: a failure here must never block the dashboard.
   const [progress, setProgress] = useState<ProgressResponse | null>(null);
+  const [usage, setUsage] = useState<UsageResponse | null>(null);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -79,6 +81,17 @@ export default function DashboardPage() {
       .then(setProgress)
       .catch((err) => {
         if (!controller.signal.aborted) console.warn("Progress insights unavailable:", err);
+      });
+    return () => controller.abort();
+  }, [reloadKey]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    api.usage
+      .get(controller.signal)
+      .then(setUsage)
+      .catch((err) => {
+        if (!controller.signal.aborted) console.warn("Usage unavailable:", err);
       });
     return () => controller.abort();
   }, [reloadKey]);
@@ -394,6 +407,9 @@ export default function DashboardPage() {
 
         {/* ── Where to focus ── */}
         {!loading && progress && <ProgressInsights data={progress} />}
+
+        {/* ── AI usage ── */}
+        {!loading && usage && <UsageCard data={usage} />}
 
         {/* ── Score trend ── */}
         {!loading && scored.length > 0 && (

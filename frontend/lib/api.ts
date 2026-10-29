@@ -81,8 +81,10 @@ function parseDetail(text: string, status: number): string {
 // ── Core request ──────────────────────────────────────────────────────────────
 
 type RequestOptions = {
-  method?: "GET" | "POST" | "DELETE";
+  method?: "GET" | "POST" | "PUT" | "DELETE";
   body?: unknown;
+  /** Send a file as the raw request body (uploads). Takes precedence over `body`. */
+  rawBody?: { data: Blob; filename: string };
   /** Send the bearer token (default true). */
   authenticated?: boolean;
   timeoutMs?: number;
@@ -92,6 +94,9 @@ type RequestOptions = {
 function handleUnauthorized() {
   auth.clear();
   if (typeof window !== "undefined" && window.location.pathname !== "/login") {
+    // A full page load is intended: this module has no router, and it drops all
+    // in-memory state once the session is gone.
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
     window.location.assign("/login?expired=1");
   }
 }
@@ -100,13 +105,20 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   const {
     method = "GET",
     body,
+    rawBody,
     authenticated = true,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     signal,
   } = options;
 
   const headers: Record<string, string> = { Accept: "application/json" };
-  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (rawBody) {
+    headers["Content-Type"] = rawBody.data.type || "application/octet-stream";
+    // Header values must be ISO-8859-1; the server only needs a display name.
+    headers["X-Filename"] = rawBody.filename.replace(/[^\x20-\x7e]/g, "_").slice(0, 200);
+  } else if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
 
   if (authenticated) {
     const session = auth.load();
@@ -131,7 +143,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     res = await fetch(`${BASE}${path}`, {
       method,
       headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+      body: rawBody ? rawBody.data : body !== undefined ? JSON.stringify(body) : undefined,
       signal: controller.signal,
     });
   } catch (e) {
@@ -153,7 +165,124 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   return (await res.json()) as T;
 }
 
+// ── Streaming (Server-Sent Events over fetch) ────────────────────────────────
+
+type SseHandlers = Record<string, (data: never) => void>;
+
+/**
+ * POST `body` to a streaming endpoint and dispatch each event to `handlers`.
+ * Resolves with the payload of the final `result` event; an `error` event
+ * (or a stream that ends without a result) becomes an ApiError. `fetch` is
+ * used instead of EventSource because the request needs a POST body and an
+ * Authorization header.
+ */
+async function streamRequest<T>(
+  path: string,
+  body: unknown,
+  handlers: SseHandlers,
+  timeoutMs: number,
+): Promise<T> {
+  const session = auth.load();
+  if (!session) {
+    handleUnauthorized();
+    throw new ApiError(401, "Please sign in again.");
+  }
+
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    let res: Response;
+    try {
+      res = await fetch(`${BASE}${path}`, {
+        method: "POST",
+        headers: {
+          Accept: "text/event-stream",
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify(body ?? {}),
+        signal: controller.signal,
+      });
+    } catch {
+      throw timedOut ? new ApiError(0, "Request timed out", true) : new ApiError(0, "Network error");
+    }
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      if (res.status === 401) handleUnauthorized();
+      throw new ApiError(res.status, parseDetail(text, res.status));
+    }
+    if (!res.body) throw new ApiError(0, "Streaming is not supported by this browser.");
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let result: T | undefined;
+    let gotResult = false;
+
+    const dispatch = (block: string) => {
+      let event = "message";
+      const dataLines: string[] = [];
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+      }
+      if (dataLines.length === 0) return;
+      let data: unknown;
+      try {
+        data = JSON.parse(dataLines.join("\n"));
+      } catch {
+        return;
+      }
+      if (event === "result") {
+        result = data as T;
+        gotResult = true;
+      } else if (event === "error") {
+        const err = data as { status?: number; detail?: string };
+        throw new ApiError(err.status ?? 500, err.detail ?? "Request failed");
+      } else {
+        handlers[event]?.(data as never);
+      }
+    };
+
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let boundary: number;
+        while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+          const block = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          dispatch(block);
+        }
+      }
+      if (buffer.trim()) dispatch(buffer);
+    } catch (e) {
+      if (e instanceof ApiError) throw e;
+      throw timedOut ? new ApiError(0, "Request timed out", true) : new ApiError(0, "Connection lost");
+    }
+
+    if (!gotResult) {
+      throw new ApiError(0, "The connection closed before the server finished. Reload to see the latest state.");
+    }
+    return result as T;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
+
+/** Real pipeline stages reported while an interview is being prepared. */
+export type StartStage = "searching" | "scraping" | "extracting" | "indexing" | "planning" | "starting";
+/** Stages reported while an answer is processed. */
+export type AnswerStage = "evaluating" | "preparing_next" | "report";
 
 export type Difficulty = "Easy" | "Medium" | "Hard";
 
@@ -171,6 +300,19 @@ export type Blueprint = {
   /** Plain-language notices about what could not be done (research, planner). */
   warnings?: string[];
 };
+
+export type StartInterviewBody = {
+      user_id?: number;
+      username: string;
+      company: string;
+      role: string;
+      /** Omit (or "auto") to use the researched difficulty. */
+      difficulty?: Difficulty | "auto";
+      /** Re-run company research even if a fresh cached profile exists. */
+      refresh_research?: boolean;
+      /** Tailor questions to the stored resume (its text is sent to the AI provider). */
+      use_resume?: boolean;
+    };
 
 export type StartInterviewResponse = {
   interview_id: number;
@@ -226,6 +368,36 @@ export type SubmitAnswerResponse = {
   next_acknowledgment: string | null;
   /** True when the report was generated together with the final answer. */
   report_ready: boolean;
+  /** "technical" | "behavioral" | "coding" for the next question (null when finished). */
+  next_question_type?: string | null;
+};
+
+export type ResumeInfo =
+  | { has_resume: false }
+  | {
+      has_resume: true;
+      filename: string;
+      content_type: string;
+      characters: number;
+      updated_at: string | null;
+      preview: string;
+    };
+
+export type TokenTotals = {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  /** Null unless token prices are configured on the server. */
+  estimated_cost_usd: number | null;
+};
+
+export type UsageResponse = {
+  today: TokenTotals;
+  all_time: TokenTotals;
+  daily_token_limit: number | null;
+  daily_tokens_remaining: number | null;
+  per_interview: ({ interview_id: number; company: string; role: string } & TokenTotals)[];
+  cost_estimates_enabled: boolean;
 };
 
 export type LoginResponse = {
@@ -352,21 +524,24 @@ export type InterviewSummary = {
 
 export const api = {
   interviews: {
-    start: (body: {
-      user_id?: number;
-      username: string;
-      company: string;
-      role: string;
-      /** Omit (or "auto") to use the researched difficulty. */
-      difficulty?: Difficulty | "auto";
-      /** Re-run company research even if a fresh cached profile exists. */
-      refresh_research?: boolean;
-    }) =>
+    start: (body: StartInterviewBody) =>
       request<StartInterviewResponse>("/api/interviews/start", {
         method: "POST",
         body,
         timeoutMs: START_TIMEOUT_MS,
       }),
+
+    /** Same as `start` but reports real progress while the interview is prepared. */
+    startStream: (
+      body: StartInterviewBody,
+      onStage?: (stage: StartStage) => void,
+    ) =>
+      streamRequest<StartInterviewResponse>(
+        "/api/interviews/start/stream",
+        body,
+        { stage: (d: { stage: StartStage }) => onStage?.(d.stage) },
+        START_TIMEOUT_MS,
+      ),
 
     get: (id: number, signal?: AbortSignal) =>
       request<InterviewDetail>(`/api/interviews/${id}`, { signal }),
@@ -385,6 +560,25 @@ export const api = {
         body: { answer },
         timeoutMs: LLM_TIMEOUT_MS,
       }),
+
+    /** Streams the evaluation as soon as the answer is scored, then the next question. */
+    submitAnswerStream: (
+      id: number,
+      answer: string,
+      handlers: {
+        onStage?: (stage: AnswerStage) => void;
+        onEvaluation?: (evaluation: Evaluation) => void;
+      } = {},
+    ) =>
+      streamRequest<SubmitAnswerResponse>(
+        `/api/interviews/${id}/answer/stream`,
+        { answer },
+        {
+          stage: (d: { stage: AnswerStage }) => handlers.onStage?.(d.stage),
+          evaluation: (d: { evaluation: Evaluation }) => handlers.onEvaluation?.(d.evaluation),
+        },
+        LLM_TIMEOUT_MS,
+      ),
 
     complete: (id: number) =>
       request<CompleteInterviewResponse>(`/api/interviews/${id}/complete`, {
@@ -430,6 +624,21 @@ export const api = {
 
   progress: {
     get: (signal?: AbortSignal) => request<ProgressResponse>("/api/progress", { signal }),
+  },
+
+  usage: {
+    get: (signal?: AbortSignal) => request<UsageResponse>("/api/usage", { signal }),
+  },
+
+  resume: {
+    get: () => request<ResumeInfo>("/api/resume"),
+    upload: (file: File) =>
+      request<Extract<ResumeInfo, { has_resume: true }>>("/api/resume", {
+        method: "PUT",
+        rawBody: { data: file, filename: file.name },
+        timeoutMs: 60_000,
+      }),
+    remove: () => request<ResumeInfo>("/api/resume", { method: "DELETE" }),
   },
 
   shared: {

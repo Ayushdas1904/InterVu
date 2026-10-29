@@ -1,6 +1,7 @@
 "use client";
-import { api, auth, errorMessage } from "@/lib/api";
-import { useState } from "react";
+import { api, auth, errorMessage, type ResumeInfo, type StartStage } from "@/lib/api";
+import { useEffect, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import AppShell from "@/components/layout/app-shell";
 import {
@@ -33,6 +34,18 @@ const PIPELINE_STEPS = [
 ];
 
 type PipelineStep = "researching" | "extracting" | "building" | "generating";
+
+const STEP_ORDER: PipelineStep[] = ["researching", "extracting", "building", "generating"];
+
+/** Which visible step each real server stage belongs to. */
+const STAGE_TO_STEP: Record<StartStage, PipelineStep> = {
+  searching: "researching",
+  scraping: "researching",
+  extracting: "extracting",
+  indexing: "building", // embedding the scraped pages into the knowledge base
+  planning: "generating",
+  starting: "generating",
+};
 type Difficulty = "Easy" | "Medium" | "Hard";
 
 export default function NewInterviewPage() {
@@ -46,6 +59,21 @@ export default function NewInterviewPage() {
   const [pipelineStep, setPipelineStep] = useState<PipelineStep | null>(null);
   const [doneSteps, setDoneSteps] = useState<string[]>([]);
   const [startError, setStartError] = useState<string | null>(null);
+  const [resume, setResume] = useState<ResumeInfo | null>(null);
+  const [useResume, setUseResume] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.resume
+      .get()
+      .then((info) => {
+        if (!cancelled) setResume(info);
+      })
+      .catch(() => undefined); // optional: the wizard works without it
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const  user  = auth.load();
   const userName = user?.name ?? "Candidate";
@@ -59,26 +87,26 @@ export default function NewInterviewPage() {
     setLoading(true);
     setStartError(null);
     setDoneSteps([]);
-    const steps: PipelineStep[] = ["researching", "extracting", "building", "generating"];
-    setPipelineStep(steps[0]);
+    setPipelineStep(null);
     try {
       // The token identifies the user; user_id is no longer needed.
-      const resultPromise = api.interviews.start({
-        username: userName,
-        company,
-        role: role.trim(),
-        difficulty,
-      });
-      // Avoid an unhandled rejection while the progress animation runs.
-      resultPromise.catch(() => undefined);
-
-      for(let i = 1; i < steps.length; i++) {
-        await new Promise(res => setTimeout(res, 1500)); // Simulate time taken for each step
-        setDoneSteps(prev => [...prev, steps[i-1]]);
-        setPipelineStep(steps[i]);
-      }
-      const result = await resultPromise;
-      setDoneSteps(prev => [...prev, steps[steps.length - 1]]);
+      const result = await api.interviews.startStream(
+        {
+          username: userName,
+          company,
+          role: role.trim(),
+          difficulty,
+          use_resume: useResume && resume?.has_resume === true,
+        },
+        (stage) => {
+          // Real progress from the server: everything before this step is done.
+          const step = STAGE_TO_STEP[stage];
+          const index = STEP_ORDER.indexOf(step);
+          setDoneSteps(STEP_ORDER.slice(0, index));
+          setPipelineStep(step);
+        },
+      );
+      setDoneSteps(STEP_ORDER);
       router.push(`/interview/${result.interview_id}`);
     } catch (error) {
       console.error("Error starting interview:", error);
@@ -333,12 +361,35 @@ export default function NewInterviewPage() {
                     { label: "Company",    value: company },
                     { label: "Role",       value: role },
                     { label: "Difficulty", value: difficulty },
+                    { label: "Resume",     value: useResume && resume?.has_resume ? "Used to tailor questions" : "Not used" },
                   ].map(item => (
                     <div key={item.label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: "1px solid var(--border-subtle)" }}>
                       <span style={{ fontSize: "13px", color: "var(--text-muted)" }}>{item.label}</span>
                       <span style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-primary)" }}>{item.value}</span>
                     </div>
                   ))}
+                </div>
+                <div id="resume-option" style={{ marginBottom: "20px", fontSize: "12.5px", color: "var(--text-secondary)", lineHeight: 1.6 }}>
+                  {resume?.has_resume ? (
+                    <label style={{ display: "flex", gap: "10px", alignItems: "flex-start", cursor: "pointer" }}>
+                      <input
+                        id="use-resume-checkbox"
+                        type="checkbox"
+                        checked={useResume}
+                        onChange={(e) => setUseResume(e.target.checked)}
+                        style={{ marginTop: "3px" }}
+                      />
+                      <span>
+                        Tailor questions to my resume ({resume.filename}). The text of your resume is sent to the AI
+                        provider (Groq) for this interview. <Link href="/resume" style={{ color: "#68a9ba" }}>Manage resume</Link>
+                      </span>
+                    </label>
+                  ) : (
+                    <span>
+                      Want questions about your own projects?{" "}
+                      <Link href="/resume" style={{ color: "#68a9ba" }}>Upload a resume</Link> (optional).
+                    </span>
+                  )}
                 </div>
                 {startError && (
                   <p role="alert" style={{ fontSize: "13px", color: "#EF4444", marginBottom: "16px", lineHeight: 1.5 }}>
