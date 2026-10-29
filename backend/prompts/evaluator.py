@@ -4,6 +4,10 @@ EVALUATOR_PROMPT = """You are a senior technical interviewer at {company} evalua
 {question}
 ## Candidate's Answer:
 {answer}
+
+## Security rule
+{untrusted_notice}
+
 ## Reference Context (use this to assess correctness):
 {context}
 

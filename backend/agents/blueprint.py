@@ -93,7 +93,8 @@ class BlueprintGenerator:
     def _fallback(self, difficulty: str) -> dict[str, Any]:
         sections = SECTION_DEFAULTS.get(difficulty.lower(), SECTION_DEFAULTS["medium"])
         # Deep copy so callers can never mutate the shared defaults.
-        return {"sections": sort_sections(copy.deepcopy(sections))}
+        # ``fallback`` tells the API this is the generic plan, not an AI-made one.
+        return {"sections": sort_sections(copy.deepcopy(sections)), "fallback": True}
     
     async def generate(
         self,

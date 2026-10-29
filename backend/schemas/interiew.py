@@ -5,6 +5,7 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from utils.difficulty import parse_difficulty
+from utils.prompt_safety import clean_line
 
 _AUTO_DIFFICULTY = {"", "auto", "default", "research"}
 
@@ -19,11 +20,15 @@ class StartInterviewRequest(BaseModel):
     # "Easy" | "Medium" | "Hard" (any case). None / "auto" uses the
     # difficulty inferred by the research pipeline.
     difficulty: str | None = None
+    # Re-run the research pipeline even when a fresh cached profile exists.
+    refresh_research: bool = False
 
     @field_validator("username", "company", "role", mode="before")
     @classmethod
-    def _strip(cls, value: Any) -> Any:
-        return value.strip() if isinstance(value, str) else value
+    def _clean(cls, value: Any) -> Any:
+        # One short line without control characters or prompt-looking tags:
+        # these values are embedded in LLM prompts and search queries.
+        return clean_line(value, 255) if isinstance(value, str) else value
 
     @field_validator("difficulty", mode="before")
     @classmethod
@@ -45,6 +50,9 @@ class StartInterviewResponse(BaseModel):
     first_question: str
     blueprint: dict[str, Any]
     difficulty: str | None = None
+    # True when part of the pipeline fell back to defaults; ``warnings`` says why.
+    degraded: bool = False
+    warnings: list[str] = Field(default_factory=list)
 
 
 class SubmitAnswerRequest(BaseModel):

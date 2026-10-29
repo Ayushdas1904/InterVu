@@ -9,6 +9,7 @@ FastAPI lifespan, so create_tables()/init_graph() are never called.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -179,6 +180,8 @@ def start_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         key_insights=[],
         dsa_questions=[],
         difficulty="easy",
+        # A recent profile, so the cached path is taken (no refresh).
+        updated_at=datetime.now(timezone.utc),
     )
 
     async def fake_get_profile(db: Any, company: str, role: str) -> Any:

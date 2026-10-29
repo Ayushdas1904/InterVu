@@ -28,7 +28,10 @@ configure_logging()
 
 from api.auth import router as auth_router  # noqa: E402
 from api.interview import router as interview_router  # noqa: E402
+from api.progress import router as progress_router  # noqa: E402
 from api.report import router as report_router  # noqa: E402
+from api.shares import owner_router as share_owner_router  # noqa: E402
+from api.shares import public_router as share_public_router  # noqa: E402
 from db.postgres import create_tables, engine  # noqa: E402
 from graph.interview_graph import close_graph, init_graph, is_graph_ready  # noqa: E402
 from utils.auth import auth_disabled, get_auth_secret, is_production  # noqa: E402
@@ -143,6 +146,9 @@ app.add_middleware(
 # ── Routers ────────────────────────────────────────────────────────────────────
 app.include_router(interview_router)
 app.include_router(report_router)
+app.include_router(share_owner_router)
+app.include_router(share_public_router)
+app.include_router(progress_router)
 app.include_router(auth_router)
 
 

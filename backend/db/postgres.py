@@ -10,6 +10,7 @@ Schema:
   - responses
   - reports
   - research_profiles
+  - report_shares   (opt-in public read-only links to a report)
 
 Environment:
   DATABASE_URL  SQLAlchemy async URL (postgresql+asyncpg://...).
@@ -173,6 +174,13 @@ class Interview(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    share = relationship(
+        "ReportShare",
+        back_populates="interview",
+        uselist=False,
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class Question(Base):
@@ -248,6 +256,26 @@ class Report(Base):
     created_at = Column(DateTime(timezone=True), default=_utcnow)
 
     interview = relationship("Interview", back_populates="report")
+
+
+class ReportShare(Base):
+    """
+    An opt-in, revocable, expiring public link to one interview's report.
+    The unguessable ``token`` is the only credential; see api/shares.py for
+    exactly what a link exposes.
+    """
+
+    __tablename__ = "report_shares"
+
+    id = Column(Integer, primary_key=True, index=True)
+    interview_id = Column(
+        Integer, ForeignKey("interviews.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+    interview = relationship("Interview", back_populates="share")
 
 
 # ── Engine & Session ───────────────────────────────────────────────────────────

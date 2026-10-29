@@ -17,9 +17,12 @@ from langchain_groq import ChatGroq
 from config import AGENT_GROQ_KEY_SLOT, FeedbackModel as model, groq_api_key
 from prompts.feedback import FEEDBACK_PROMPT
 from schemas.feedback import Report
+from utils.prompt_safety import UNTRUSTED_TEXT_NOTICE, clean_line, fence
 from utils.llm_json import invoke_llm_json
 
 logger = logging.getLogger(__name__)
+
+MAX_ANSWER_CHARS = 4000
 
 FALLBACK_REPORT = {
     "overall_score": 0,
@@ -84,18 +87,19 @@ class FeedbackAgent:
             return fallback_report()
 
         qa_text = "\n\n".join(
-            f"Section: {pair.get('section', 'Unknown')}\n"
+            f"Section: {clean_line(pair.get('section', 'Unknown'))}\n"
             f"Q: {pair.get('question', '')}\n"
-            f"A: {pair.get('answer', '')}\n"
+            f"A: {fence(pair.get('answer', ''), max_chars=MAX_ANSWER_CHARS)}\n"
             f"Score: {(pair.get('evaluation') or {}).get('score', 'N/A')}\n"
             f"Feedback: {(pair.get('evaluation') or {}).get('brief_feedback', 'N/A')}"
             for pair in qa_pairs
         )
 
         prompt = FEEDBACK_PROMPT.format(
-            company=company,
-            role=role,
+            company=clean_line(company),
+            role=clean_line(role),
             qa_text=qa_text,
+            untrusted_notice=UNTRUSTED_TEXT_NOTICE,
         )
 
         try:

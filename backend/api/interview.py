@@ -39,7 +39,13 @@ from agents.registry import blueprint_generator
 from db.postgres import Interview, Question, Report, Response, get_db
 from graph.interview_graph import InterviewState, get_compiled_graph, graph_config
 from pipeline import ResearchPipeline
-from research import get_research_profile, is_cacheable, save_research_profile
+from research import (
+    get_research_profile,
+    is_cacheable,
+    is_stale,
+    save_research_profile,
+    update_research_profile,
+)
 from schemas.interiew import (
     StartInterviewRequest,
     StartInterviewResponse,
@@ -111,6 +117,35 @@ async def _mark_graph_complete(interview_id: int) -> None:
         logger.warning("Could not mark graph state complete for interview %s: %s", interview_id, exc)
 
 
+def _profile_to_extracted(profile: Any) -> dict[str, Any]:
+    """The extractor-shaped dict for a stored ResearchProfile."""
+    return {
+        "skills": profile.skills,
+        "technologies": profile.technologies,
+        "topics": profile.topics,
+        "rounds": profile.rounds,
+        "behavioral_patterns": profile.behavioral_patterns,
+        "key_insights": profile.key_insights,
+        "dsa_questions": profile.dsa_questions,
+        "difficulty": profile.difficulty,
+    }
+
+
+async def _run_research(company: str, role: str) -> dict[str, Any] | None:
+    """
+    Run the research pipeline. Returns the extracted knowledge, or None when
+    the pipeline could not even run (for example a missing API key), so the
+    caller can degrade instead of returning a 500.
+    """
+    try:
+        pipeline = ResearchPipeline()
+        result = await pipeline.run(company, role)
+        return result["extracted"]
+    except Exception:  # noqa: BLE001 - research is best-effort
+        logger.exception("Research pipeline failed for %s / %s.", company, role)
+        return None
+
+
 def _blueprint_skills(blueprint: dict[str, Any] | None, limit: int = 4) -> list[str]:
     skills: list[str] = []
     for section in (blueprint or {}).get("sections", []):
@@ -137,32 +172,45 @@ async def start_interview(
     company = body.company
     role = body.role
 
+    warnings: list[str] = []
     profile = await get_research_profile(db, company, role)
+    extracted: dict[str, Any] | None = None
+    research_failed = False
 
-    if profile:
-        logger.info("Research profile found for %s / %s, skipping pipeline.", company, role)
-        extracted = {
-            "skills": profile.skills,
-            "technologies": profile.technologies,
-            "topics": profile.topics,
-            "rounds": profile.rounds,
-            "behavioral_patterns": profile.behavioral_patterns,
-            "key_insights": profile.key_insights,
-            "dsa_questions": profile.dsa_questions,
-            "difficulty": profile.difficulty,
-        }
+    if profile is not None:
+        extracted = _profile_to_extracted(profile)
+        if body.refresh_research or is_stale(profile):
+            logger.info(
+                "Research profile for %s / %s is %s; refreshing.",
+                company, role, "being force-refreshed" if body.refresh_research else "stale",
+            )
+            fresh = await _run_research(company, role)
+            if fresh is not None and is_cacheable(fresh):
+                profile = await update_research_profile(db, profile, fresh)
+                extracted = _profile_to_extracted(profile)
+            else:
+                # Keep serving the old profile rather than failing the interview.
+                warnings.append(
+                    f"Saved research for {company} could not be refreshed, so questions use older information."
+                )
+        else:
+            logger.info("Research profile found for %s / %s, skipping pipeline.", company, role)
     else:
         logger.info("No research profile for %s / %s, running pipeline.", company, role)
-        pipeline = ResearchPipeline()
-        result = await pipeline.run(company, role)
-        extracted = result["extracted"]
-        if is_cacheable(extracted):
+        fresh = await _run_research(company, role)
+        if fresh is not None and is_cacheable(fresh):
+            extracted = fresh
             await save_research_profile(db, company, role, extracted)
         else:
             # Never cache an empty or failed extraction: the next start retries research.
             logger.warning(
                 "Research for %s / %s produced no skills, topics or rounds; not caching it.",
                 company, role,
+            )
+            research_failed = True
+            extracted = fresh or {}
+            warnings.append(
+                f"Live research on {company} was unavailable, so the questions are general rather than tailored to {company}."
             )
 
     # The candidate's explicit choice wins over the researched estimate.
@@ -177,6 +225,27 @@ async def start_interview(
         dsa_questions=extracted.get("dsa_questions", []),
         difficulty=difficulty,
     )
+
+    blueprint_failed = bool(blueprint.get("fallback"))
+    if blueprint_failed:
+        warnings.append("The AI interview planner was unavailable, so a standard interview plan is being used.")
+
+    if research_failed and blueprint_failed:
+        # Both the research and the LLM are down: an interview now would be a
+        # generic script with no AI behind it. Fail fast with a clear message
+        # instead of silently starting a degraded session.
+        logger.error("Refusing to start an interview for %s / %s: research and planner both failed.", company, role)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The research and AI services are unavailable right now, so a useful interview "
+                "cannot be started. Check the API keys and network access, then try again."
+            ),
+        )
+
+    if warnings:
+        # Persisted with the blueprint so a resumed interview still shows the notice.
+        blueprint = {**blueprint, "degraded": True, "warnings": list(warnings)}
 
     interview = Interview(
         user_id=owner_id,
@@ -234,6 +303,8 @@ async def start_interview(
         first_question=first_question,
         blueprint=blueprint,
         difficulty=difficulty,
+        degraded=bool(warnings),
+        warnings=warnings,
     )
 
 

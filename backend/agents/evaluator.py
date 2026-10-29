@@ -22,9 +22,13 @@ from langchain_groq import ChatGroq
 from config import AGENT_GROQ_KEY_SLOT, EvaluatorModel as model, groq_api_key
 from prompts.evaluator import EVALUATOR_PROMPT
 from schemas.evaluator import Evaluation
+from utils.prompt_safety import UNTRUSTED_TEXT_NOTICE, clean_line, fence
 from utils.llm_json import invoke_llm_json
 
 logger = logging.getLogger(__name__)
+
+# Longer answers are truncated before they reach the prompt.
+MAX_ANSWER_CHARS = 8000
 
 FALLBACK_EVALUATION = {
     "score": 5.0,
@@ -86,12 +90,14 @@ class EvaluatorAgent:
             }
         """
         prompt = EVALUATOR_PROMPT.format(
-            company=company,
-            role=role,
-            section=section,
+            company=clean_line(company),
+            role=clean_line(role),
+            section=clean_line(section),
             question=question,
             question_type=question_type,
-            answer=answer,
+            # The answer is untrusted: fenced so it cannot pose as instructions.
+            answer=fence(answer, max_chars=MAX_ANSWER_CHARS),
+            untrusted_notice=UNTRUSTED_TEXT_NOTICE,
             context=context
         )
         try:

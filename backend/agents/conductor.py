@@ -19,10 +19,12 @@ from config import AGENT_GROQ_KEY_SLOT, ConductorModel as model, groq_api_key
 from prompts.conductor import CONDUCTOR_PROMPT
 from schemas.conductor import ConductorTurn
 from utils.llm_json import invoke_llm_json
+from utils.prompt_safety import UNTRUSTED_TEXT_NOTICE, clean_line, fence
 
 logger = logging.getLogger(__name__)
 
 MAX_QUESTIONS_PER_SECTION = 3
+MAX_ANSWER_CHARS = 2000  # per answer in the running transcript
 
 FALLBACK_TURN = {
     "acknowledgment": "",
@@ -103,7 +105,7 @@ def _format_conversation_history(qa_history: list[dict[str, Any]]) -> str:
         score = (entry.get("evaluation") or {}).get("score", "N/A")
         lines.append(
             f"[{entry.get('section', 'Unknown')}] Q: {entry.get('question', '')}\n"
-            f"A: {entry.get('answer', '')}\n"
+            f"A: {fence(entry.get('answer', ''), max_chars=MAX_ANSWER_CHARS)}\n"
             f"Score: {score}/10"
         )
     return "\n\n".join(lines)
@@ -125,6 +127,9 @@ class ConductorAgent:
         difficulty: str,
         qa_history: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        username = clean_line(username, 60)
+        company = clean_line(company)
+        role = clean_line(role)
         candidate_name_instruction = (
             f"The candidate's name is {username}. You may address them by name occasionally and naturally, but not in every single message."
             if username
@@ -145,6 +150,7 @@ class ConductorAgent:
             context=context or "No additional context retrieved.",
             difficulty=difficulty,
             conversation_history=_format_conversation_history(qa_history),
+            untrusted_notice=UNTRUSTED_TEXT_NOTICE,
         )
 
         try:
