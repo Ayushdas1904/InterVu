@@ -40,6 +40,52 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
+  migrations:
+    name: Migrations (alembic on Postgres)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          # Per-run value for a throwaway container that only listens on loopback.
+          POSTGRES_PASSWORD: ci-${{ github.run_id }}
+          POSTGRES_DB: intervu
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d intervu"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ENV: test
+      DATABASE_URL: postgresql+asyncpg://postgres:ci-${{ github.run_id }}@127.0.0.1:5432/intervu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Apply migrations to an empty database
+        run: python -m alembic upgrade head
+      - name: Models and migrations agree (no drift)
+        run: python -m alembic check
+      - name: Downgrade and upgrade again
+        run: |
+          python -m alembic downgrade base
+          python -m alembic upgrade head
+
   frontend:
     name: Frontend (lint, build, types)
     runs-on: ubuntu-latest

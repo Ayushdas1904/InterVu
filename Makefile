@@ -15,7 +15,7 @@ ADMIN_PY   := .venv/bin/python
 .PHONY: help setup setup-backend setup-frontend setup-admin backend-env \
         backend frontend admin \
         test test-backend lint lint-frontend lint-backend check-admin \
-        db-up db-down up down
+        db-up db-down up down migrate migration
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -79,6 +79,15 @@ lint-frontend: ## ESLint, production build, then TypeScript type check
 
 check-admin: ## Django system checks for intervu-admin
 	cd $(ADMIN_DIR) && DJANGO_DEBUG=True $(ADMIN_PY) manage.py check
+
+# ── Database migrations ───────────────────────────────────────────────────────
+
+migrate: ## Apply database migrations (alembic upgrade head) to DATABASE_URL
+	cd $(BACKEND_DIR) && $(BACKEND_PY) -m alembic upgrade head
+
+migration: ## Create a migration from model changes: make migration m="add column"
+	@test -n "$(m)" || (echo 'Usage: make migration m="what changed"'; exit 1)
+	cd $(BACKEND_DIR) && $(BACKEND_PY) -m alembic revision --autogenerate -m "$(m)"
 
 # ── Database / containers ─────────────────────────────────────────────────────
 
