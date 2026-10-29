@@ -6,9 +6,10 @@ An AI-powered mock interview platform. Pick a company and a role: InterVu resear
 
 ## Contents
 
+- [Features](#features)
+- [Run it locally](#run-it-locally)
 - [How it works](#how-it-works)
 - [Architecture](#architecture)
-- [Quick start](#quick-start)
 - [Environment variables](#environment-variables)
 - [API reference](#api-reference)
 - [Running code safely](#running-code-safely)
@@ -18,6 +19,224 @@ An AI-powered mock interview platform. Pick a company and a role: InterVu resear
 - [Project structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
 - [Roadmap](#roadmap)
+
+---
+
+## Features
+
+**Interview**
+- Researches the real interview process for any company and role (web search and scraping), then builds a tailored plan and runs a turn-by-turn conversational interview.
+- Scores every answer on correctness, depth, communication and problem solving, and adapts the difficulty as you go.
+- Live progress: the new-interview screen shows the real pipeline stage, and your score appears as soon as it exists, before the next question is ready.
+- Coding questions have a built-in code editor. JavaScript runs safely in your browser; other languages are reviewed by the AI.
+- Optional voice: read questions aloud and dictate answers (off by default).
+- Optional resume: upload a PDF, DOCX or .txt resume and let the interviewer ask about your own projects.
+- Interviews survive server restarts and can be resumed from the dashboard.
+
+**Feedback and progress**
+- A detailed report: overall score, per-section scores, strong and weak topics, recommendations, JSON download and print/PDF.
+- Share a report with an unguessable, expiring, revocable public link that never shows your name, email or answers.
+- A dashboard with your score trend, improvement over time, weakest sections, a "practice next" list and your AI usage.
+
+**Reliability and safety**
+- Honest failure handling: if research or the AI planner is down you are told, and if both are down you get a clear error instead of a fake interview.
+- Per-user ownership checks, rate limits, prompt-injection hardening, and an optional daily token limit.
+- Token usage and estimated cost per interview; optional Sentry error monitoring with personal data stripped.
+- Alembic database migrations, applied automatically at startup.
+
+**Developer experience**
+- 300+ automated backend tests, GitHub Actions CI (tests, migrations on real Postgres, lint, build, types), a Makefile, Docker support and an optional read-only Django admin panel.
+
+---
+
+## Run it locally
+
+This guide gets InterVu running on your own machine from a fresh clone. It was run and checked on macOS, and CI runs the tests, migrations and build on Ubuntu. Windows is untested: use WSL2.
+
+### 1. What you need
+
+| Requirement | Version | Notes |
+|-------------|---------|-------|
+| Python | 3.11 | Other versions are not tested. |
+| Node.js | **20.9 or newer** | Next.js 16 refuses to build on older Node (the error says `>=20.9.0`). Check with `node -v`. |
+| PostgreSQL | 16 or 17 (both tested; 17 is used in Docker and CI) | Easiest through Docker, but any Postgres you already have works. |
+| Docker | optional | Only used to run Postgres (and, optionally, the whole stack). |
+| git | any | |
+
+**API keys.** A real interview calls five external services. Create an account with each and copy a key. You pay each provider directly according to your own plan, so check their current free tiers and prices; InterVu records token usage so you can watch it on the dashboard and cap it with `DAILY_TOKEN_LIMIT`.
+
+| Service | Used for | Variable in `backend/.env` | Where to get it |
+|---------|----------|----------------------------|-----------------|
+| Groq | All the AI agents (`openai/gpt-oss-120b`) | `GROQ_API_KEY` (optional: `GROQ_API_KEY_1`, `GROQ_API_KEY_2`, ... to spread load over several keys) | console.groq.com |
+| Google AI | Text embeddings for the knowledge base | `GOOGLE_API_KEY` | aistudio.google.com/apikey |
+| Tavily | Web search | `TAVILY_API_KEY` | tavily.com |
+| Firecrawl | Scraping web pages | `FIRECRAWL_API_KEY` | firecrawl.dev |
+| Anakin | Scraping Reddit threads | `ANAKIN_API_KEY` | the Anakin service (API host `api.anakin.io`) |
+
+**No keys yet?** Put any non-empty placeholder text in each key. The backend starts, you can sign in, browse the dashboard, upload a resume and open every page, but starting an interview fails with a clear "research and AI services are unavailable" error. The automated tests (`make test`) need no keys or database at all.
+
+### 2. Get the code
+
+```bash
+git clone <repository-url> InterVu
+cd InterVu
+```
+
+### 3. Start the database
+
+**With Docker (recommended):**
+
+```bash
+cp .env.example .env            # then edit .env and set POSTGRES_PASSWORD
+                                #   (letters and digits only, it is placed inside a URL)
+docker compose up -d postgres   # or: make db-up
+docker compose ps               # the postgres service should become "healthy"
+```
+
+Postgres is published on `127.0.0.1:5432` only, so nothing else on your network can reach it.
+
+**Without Docker:** use any Postgres you already have (Homebrew, apt, Neon, ...). Create an empty database called `intervu` (for example `createdb intervu`) and note the user and password; you will put them in the URLs in the next step.
+
+### 4. Configure and start the backend
+
+```bash
+cd backend
+python3.11 -m venv .venv
+source .venv/bin/activate                 # Windows: .venv\Scripts\activate
+pip install -r requirements.txt           # first install takes a few minutes
+cp .env.example .env
+```
+
+Now edit `backend/.env`. These are the lines you must change (everything else has a sensible default, see [Environment variables](#environment-variables)):
+
+```ini
+ENV=development                    # keep this for local work
+AUTH_SECRET=<a long random string> # python3 -c "import secrets;print(secrets.token_urlsafe(48))"
+
+# Same password you set in the root .env (or your own Postgres credentials):
+DATABASE_URL=postgresql+asyncpg://postgres:<password>@localhost:5432/intervu
+DATABASE_URL_PSYCOPG=postgresql://postgres:<password>@localhost:5432/intervu
+
+GROQ_API_KEY=...
+GOOGLE_API_KEY=...
+TAVILY_API_KEY=...
+FIRECRAWL_API_KEY=...
+ANAKIN_API_KEY=...
+```
+
+(`make backend-env` creates `backend/.env` from the example and generates `AUTH_SECRET` for you.)
+
+Start it:
+
+```bash
+uvicorn main:app --reload --host 127.0.0.1 --port 8000     # or, from the repo root: make backend
+```
+
+On the first start it loads its libraries (this can take 30 seconds or more), applies the database migrations (you will see `Running upgrade  -> 0001, baseline schema`) and initialises the interview graph. Check it is healthy:
+
+```bash
+curl http://127.0.0.1:8000/ready
+# {"status":"ready","checks":{"database":"ok","graph":"ok"}}
+```
+
+### 5. Start the frontend (second terminal)
+
+```bash
+cd frontend
+npm ci
+cp .env.example .env.local        # NEXT_PUBLIC_API_URL=http://localhost:8000
+npm run dev                       # or, from the repo root: make frontend
+```
+
+Open **http://127.0.0.1:3000** (or `http://localhost:3000`).
+
+### 6. Try it
+
+1. **Sign in** with any name and email (there is no password, see [Authentication model](#authentication-model)).
+2. Optional: open **Resume** in the sidebar and upload a text-based PDF, DOCX or .txt resume.
+3. Click **New Interview**, pick a company and role, choose a difficulty and start. The first run for a company researches the web, so allow a minute or two; you will see the real stages go by. Later interviews for the same company and role start much faster because the research is cached.
+4. Answer the questions. On a coding question press the `</>` button to open the code editor, press **Run** (JavaScript only) and **Add to my answer**. The speaker and microphone buttons turn on read-aloud and dictation.
+5. When the interview ends you land on your **report**. From there you can download it, print it or create a share link.
+6. The **Dashboard** shows your history, score trend, weakest sections and AI usage.
+
+### Stopping, resetting and updating
+
+```bash
+# stop the app: Ctrl+C in the backend and frontend terminals
+docker compose down              # stop Postgres, keep your data
+docker compose down -v           # stop Postgres AND delete all data
+rm -rf backend/chroma_db         # forget the scraped knowledge base (rebuilt as needed)
+
+git pull
+pip install -r backend/requirements.txt   # new dependencies, if any
+(cd frontend && npm ci)
+# restart the backend: pending database migrations are applied automatically
+```
+
+### Handy commands
+
+```bash
+make help        # every command with a description
+make test        # backend test suite (no keys or database needed)
+make lint        # byte-compile, ESLint, production build, type check, Django check
+make migrate     # apply database migrations by hand
+```
+
+### Optional: everything in containers
+
+```bash
+cp .env.example .env                 # POSTGRES_PASSWORD
+cp backend/.env.example backend/.env # API keys, AUTH_SECRET
+docker compose --profile app up -d --build   # or: make up
+```
+
+This builds `backend/Dockerfile` and `frontend/Dockerfile` and starts Postgres, the backend (`127.0.0.1:8000`) and the frontend (`127.0.0.1:3000`). Compose points the backend at the `postgres` service, disables TLS for that internal connection and keeps ChromaDB data in a named volume. All ports are published on loopback only; to reach the stack from another machine use an SSH tunnel rather than publishing wider.
+
+Under compose, `ENV` comes from the root `.env` (default `development`), not from `backend/.env`: the value set in `docker-compose.yaml` takes precedence over the `env_file`, so `ENV=production` in `backend/.env` is ignored there.
+
+### Optional: admin panel
+
+A separate, read-only Django service over the same database. See [intervu-admin/README.md](intervu-admin/README.md) for details.
+
+```bash
+cd intervu-admin
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env              # keep DJANGO_DEBUG=True for local dev
+python manage.py migrate          # Django's own tables only, never InterVu's
+python manage.py createsuperuser
+python manage.py runserver 127.0.0.1:8002   # or: make admin
+```
+
+### Notes for a database that predates this version
+
+The migrations create missing tables but never alter tables that already exist, so an old database needs this one-off SQL for the extra indexes and cascade rules (run it with, for example, `docker compose exec postgres psql -U postgres -d intervu`). A database created by a recent version does not need it.
+
+```sql
+-- Indexes added for the per-user and per-interview queries.
+CREATE INDEX IF NOT EXISTS ix_interviews_user_id ON interviews (user_id);
+CREATE INDEX IF NOT EXISTS ix_questions_interview_id ON questions (interview_id);
+CREATE INDEX IF NOT EXISTS ix_responses_question_id ON responses (question_id);
+
+-- ON DELETE CASCADE on the child foreign keys (the ORM relies on it).
+-- Constraint names below are Postgres' defaults; check yours with \d <table>.
+ALTER TABLE interviews DROP CONSTRAINT IF EXISTS interviews_user_id_fkey,
+  ADD CONSTRAINT interviews_user_id_fkey FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE;
+ALTER TABLE questions DROP CONSTRAINT IF EXISTS questions_interview_id_fkey,
+  ADD CONSTRAINT questions_interview_id_fkey FOREIGN KEY (interview_id) REFERENCES interviews (id) ON DELETE CASCADE;
+ALTER TABLE responses DROP CONSTRAINT IF EXISTS responses_question_id_fkey,
+  ADD CONSTRAINT responses_question_id_fkey FOREIGN KEY (question_id) REFERENCES questions (id) ON DELETE CASCADE;
+ALTER TABLE reports DROP CONSTRAINT IF EXISTS reports_interview_id_fkey,
+  ADD CONSTRAINT reports_interview_id_fkey FOREIGN KEY (interview_id) REFERENCES interviews (id) ON DELETE CASCADE;
+
+-- Placeholder (fallback) reports no longer count as a score of 0.
+UPDATE reports SET overall_score = NULL WHERE report_json->>'fallback' = 'true';
+
+-- Optional: drop research profiles cached from a failed (empty) extraction.
+DELETE FROM research_profiles
+WHERE skills::text = '[]' AND topics::text = '[]' AND rounds::text = '[]';
+```
 
 ---
 
@@ -60,7 +279,8 @@ An AI-powered mock interview platform. Pick a company and a role: InterVu resear
                                      v
 +------------------------------------------------------------------------+
 | FastAPI backend (backend/main.py)                                      |
-|   /api/auth  /api/interviews  /api/reports  /health  /ready            |
+|   /api/auth  /api/interviews (+SSE streams)  /api/reports  /api/shared  |
+|   /api/progress  /api/resume  /api/usage  /health  /ready              |
 |                                                                        |
 |   ResearchPipeline --> Tavily (search), Firecrawl + Anakin (scrape)    |
 |          |                                                             |
@@ -74,8 +294,10 @@ An AI-powered mock interview platform. Pick a company and a role: InterVu resear
                   |                                   ^
                   v                                   | read-only
           PostgreSQL 17 (users, interviews,           |
-          questions, responses, reports,     intervu-admin (Django 5.1 +
-          research_profiles, graph checkpoints)  DRF): admin UI + REST API
+          questions, responses, reports,      intervu-admin (Django 5.1 +
+          research_profiles, report_shares,    DRF): admin UI + REST API
+          resumes, llm_usage, checkpoints)
+          schema managed by Alembic
 ```
 
 | Agent | Model | Provider |
@@ -94,125 +316,15 @@ Model names live in `backend/config.py`. LLM calls go through `backend/utils/llm
 | Layer | Technology |
 |-------|------------|
 | Frontend | Next.js 16, React 19, TypeScript, Tailwind CSS 4, Recharts |
-| Backend | Python 3.11, FastAPI, LangGraph, SQLAlchemy 2 (async, asyncpg) |
+| Backend | Python 3.11, FastAPI, LangGraph, SQLAlchemy 2 (async, asyncpg), Alembic, pypdf |
 | LLMs | Groq (`openai/gpt-oss-120b`) |
 | Embeddings / vector DB | Google `gemini-embedding-001`, ChromaDB (local persistent) |
 | Graph state | LangGraph `AsyncPostgresSaver` (psycopg) |
 | Database | PostgreSQL 17 (docker compose locally; any Postgres such as Neon works) |
 | Web research | Tavily, Firecrawl, Anakin |
 | Admin panel | Django 5.1, Django REST Framework, django-filter, SimpleJWT |
+| Monitoring (optional) | Sentry (backend, personal data stripped) |
 | Tooling | pytest, ESLint, GitHub Actions, Docker, Makefile |
-
----
-
-## Quick start
-
-Prerequisites: Python 3.11, Node.js 20, Docker (for the local database), and API keys for Groq, Google AI, Tavily, Firecrawl and Anakin.
-
-A `Makefile` wraps every command below (`make help` lists them). Commands are shown for macOS/Linux; on Windows activate virtualenvs with `.venv\Scripts\activate`.
-
-### 1. Database
-
-```bash
-# From the repository root
-cp .env.example .env          # then set POSTGRES_PASSWORD (URL-safe characters only)
-docker compose up -d postgres # or: make db-up
-```
-
-Postgres is published on `127.0.0.1:5432` only and has a `pg_isready` healthcheck.
-
-### 2. Backend
-
-```bash
-cd backend
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt -r requirements-dev.txt
-
-cp .env.example .env
-# Fill in API keys, put POSTGRES_PASSWORD into DATABASE_URL and
-# DATABASE_URL_PSYCOPG, keep ENV=development and set AUTH_SECRET:
-#   python3 -c "import secrets;print(secrets.token_urlsafe(48))"
-# (`make setup-backend` or `make backend-env` creates backend/.env and
-# generates AUTH_SECRET for you when it is blank.)
-
-uvicorn main:app --reload --host 127.0.0.1 --port 8000   # or: make backend
-```
-
-**`ENV` fails closed.** Only `development`, `dev`, `test` and `local` count as development. With `ENV` unset (or any other value) the backend behaves as production: it refuses to start without `AUTH_SECRET`, ignores `AUTH_DISABLED` and does not add the localhost CORS origins. Without a fixed `AUTH_SECRET` in development, every `--reload` signs everybody out.
-
-Tables and the LangGraph checkpoint tables are created on startup. Check `http://127.0.0.1:8000/ready`; it returns 200 once the database and graph are ready.
-
-**Upgrading an existing `backend/.env`.** A `.env` created before `ENV` fails closed has no `ENV` line, so the backend now starts in production mode. Add `ENV=development` and a non-empty `AUTH_SECRET` to it (`make backend` runs `make backend-env`, which generates a blank `AUTH_SECRET` and warns when `ENV` is missing).
-
-#### Upgrading an existing database
-
-`create_all` only creates missing tables; it does not add indexes or change foreign keys on tables that already exist. If your database predates this version, run this once (for example with `docker compose exec postgres psql -U postgres -d intervu`):
-
-```sql
--- Indexes added for the per-user and per-interview queries.
-CREATE INDEX IF NOT EXISTS ix_interviews_user_id ON interviews (user_id);
-CREATE INDEX IF NOT EXISTS ix_questions_interview_id ON questions (interview_id);
-CREATE INDEX IF NOT EXISTS ix_responses_question_id ON responses (question_id);
-
--- ON DELETE CASCADE on the child foreign keys (the ORM relies on it).
--- Constraint names below are Postgres' defaults; check yours with \d <table>.
-ALTER TABLE interviews DROP CONSTRAINT IF EXISTS interviews_user_id_fkey,
-  ADD CONSTRAINT interviews_user_id_fkey FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE;
-ALTER TABLE questions DROP CONSTRAINT IF EXISTS questions_interview_id_fkey,
-  ADD CONSTRAINT questions_interview_id_fkey FOREIGN KEY (interview_id) REFERENCES interviews (id) ON DELETE CASCADE;
-ALTER TABLE responses DROP CONSTRAINT IF EXISTS responses_question_id_fkey,
-  ADD CONSTRAINT responses_question_id_fkey FOREIGN KEY (question_id) REFERENCES questions (id) ON DELETE CASCADE;
-ALTER TABLE reports DROP CONSTRAINT IF EXISTS reports_interview_id_fkey,
-  ADD CONSTRAINT reports_interview_id_fkey FOREIGN KEY (interview_id) REFERENCES interviews (id) ON DELETE CASCADE;
-
--- Placeholder (fallback) reports no longer count as a score of 0.
-UPDATE reports SET overall_score = NULL WHERE report_json->>'fallback' = 'true';
-
--- Optional: drop research profiles cached from a failed (empty) extraction.
-DELETE FROM research_profiles
-WHERE skills::text = '[]' AND topics::text = '[]' AND rounds::text = '[]';
-```
-
-The repository has an `alembic/` environment but no revisions; the SQL above is the supported upgrade path for now.
-
-### 3. Frontend
-
-```bash
-cd frontend
-npm ci
-cp .env.example .env.local   # NEXT_PUBLIC_API_URL=http://localhost:8000
-npm run dev                  # or: make frontend
-```
-
-Open `http://localhost:3000`. The `dev` and `start` scripts bind to `127.0.0.1`.
-
-### 4. Admin panel (optional)
-
-A separate, read-only Django service over the same database. See [intervu-admin/README.md](intervu-admin/README.md) for details.
-
-```bash
-cd intervu-admin
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env              # keep DJANGO_DEBUG=True for local dev
-python manage.py migrate          # Django's own tables only, never InterVu's
-python manage.py createsuperuser
-python manage.py runserver 127.0.0.1:8002   # or: make admin
-```
-
-### Everything in containers (optional)
-
-```bash
-cp .env.example .env                 # POSTGRES_PASSWORD
-cp backend/.env.example backend/.env # API keys, AUTH_SECRET
-docker compose --profile app up -d --build   # or: make up
-```
-
-This builds `backend/Dockerfile` and `frontend/Dockerfile` and starts Postgres, the backend (`127.0.0.1:8000`) and the frontend (`127.0.0.1:3000`). Compose points the backend at the `postgres` service, disables TLS for that internal connection and keeps ChromaDB data in a named volume. All ports are published on loopback only; to reach the stack from another machine use an SSH tunnel rather than publishing wider.
-
-Under compose, `ENV` comes from the root `.env` (default `development`), not from `backend/.env`: the value set in `docker-compose.yaml` takes precedence over the `env_file`, so `ENV=production` in `backend/.env` is ignored there.
 
 ---
 
@@ -380,7 +492,7 @@ GitHub Actions (`.github/workflows/ci.yml`, read-only `contents` permission) run
 
 - **backend**: Python 3.11, install requirements, byte-compile, `pytest`.
 - **migrations**: an empty Postgres 17 service (loopback only, per-run password), `alembic upgrade head`, `alembic check`, then downgrade and upgrade again.
-- **frontend**: Node 20, `npm ci`, lint, build, `tsc --noEmit`.
+- **frontend**: Node 20 (Next.js 16 needs 20.9+), `npm ci`, lint, build, `tsc --noEmit`.
 - **admin**: install requirements, `manage.py check` with `DJANGO_DEBUG=False`.
 
 ---
@@ -429,6 +541,26 @@ InterVu/
 
 ## Troubleshooting
 
+**`You are using Node.js 18... Node.js version ">=20.9.0" is required`.** Upgrade Node to 20.9 or newer (for example `brew install node@22`, then put `/opt/homebrew/opt/node@22/bin` first on your `PATH`, or use `nvm install 22`). Open a new terminal and check `node -v`.
+
+**`ModuleNotFoundError` (for example `pypdf` or `sentry_sdk`) after pulling.** New dependencies were added. Run `pip install -r backend/requirements.txt` again inside the backend virtualenv.
+
+**Starting an interview fails with "The research and AI services are unavailable" (HTTP 503).** Both web research and the AI planner failed, almost always because of missing, placeholder or exhausted API keys. Check `backend/.env`, and the backend log: each failing call is logged with the provider's error (for example `Invalid API Key`).
+
+**The page says "Cannot reach the InterVu server".** The backend is not running, or `NEXT_PUBLIC_API_URL` points somewhere else. Check `curl http://127.0.0.1:8000/health` and `frontend/.env.local`, then restart `npm run dev` (the variable is read at start).
+
+**`Address already in use` on port 8000, 3000 or 5432.** Something else is using the port. Stop it, or stop your own Postgres if you also run Docker's. `lsof -nP -iTCP:8000 -sTCP:LISTEN` shows what is listening.
+
+**Resume upload says "Not enough readable text".** The PDF is a scan or an image. Export a text-based PDF, a DOCX, or paste the text into a `.txt` file.
+
+**"Daily AI usage limit reached" (HTTP 429).** `DAILY_TOKEN_LIMIT` is set and used up; it resets at 00:00 UTC. Raise it or set it to `0`.
+
+**The editor's Run button is disabled.** Only JavaScript runs, and only in your browser. Other languages are sent to the AI as text and never executed.
+
+**No speaker or microphone buttons.** Your browser does not offer that Web Speech feature. Chromium-based browsers such as Chrome and Edge support dictation; others may not. Both are optional.
+
+**Migration errors on startup.** Run `make migrate` to see the full message. To skip automatic migrations (for example while debugging), set `MIGRATE_ON_START=false`. Never point `alembic downgrade` at a database you care about: the baseline downgrade deletes every table.
+
 **"This interview's session state was lost" (HTTP 410).** The LangGraph checkpoint for that interview is missing, for example after the checkpoint tables were reset or the backend pointed at a different database. Your answered questions are still stored: the interview page offers "Get report for answered questions" (which calls `/end`) or a link to start a new interview.
 
 **`DATABASE_URL_PSYCOPG environment variable is not set.`** The backend refuses to start without it because the interview graph checkpoints to Postgres. Set it in `backend/.env` (same database as `DATABASE_URL`, without `+asyncpg`).
@@ -445,7 +577,7 @@ InterVu/
 
 **"Your answer is still being processed" (HTTP 409).** The previous submission of an answer is still running (for example after a client timeout). Wait a moment and reload the interview page.
 
-**A company/role always gets a generic interview plan.** Older versions could cache an empty research profile after an LLM or scraper outage. Delete that row from `research_profiles` (see [Upgrading an existing database](#upgrading-an-existing-database)); empty extractions are no longer cached.
+**A company/role always gets a generic interview plan.** Older versions could cache an empty research profile after an LLM or scraper outage. Delete that row from `research_profiles` (see [Notes for a database that predates this version](#notes-for-a-database-that-predates-this-version)); empty extractions are no longer cached.
 
 **CORS errors in the browser console.** Add the exact frontend origin (scheme, host and port) to `FRONTEND_URL` in `backend/.env`.
 
